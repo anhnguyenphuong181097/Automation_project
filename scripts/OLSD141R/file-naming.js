@@ -1,10 +1,8 @@
 // scripts/OLSD141R/file-naming.js
-// Naming rules for the OLSD141R report file (this batch has no input file of its own):
-//   MYOLSD141R<batch date YYYYMMDD>.txt
-//   - MY       : environment prefix, may differ per region (MY / ID), so the file is always
-//                located through reportFileGlob() instead of a fixed prefix
-//   - OLSD141R : report ID (EOD Batch flow v1.10 row 81: batch = OLSDR141)
-// The OLSMECIF seed file (batch OLSDB057) uses its own convention: OLSMECIF-YYYYMMDD-NN.dat.
+// Naming rules for the two generated input files and the report file of OLSD141R:
+//   OLSCUST-YYYYMMDD-NN.dat   input of OLSDB012 (creates the CIFs)
+//   OLSMECIF-YYYYMMDD-NN.dat  input of OLSDB057 (CIF merge instructions)
+//   MYOLSD141R<batch date>.txt report of OLSDR141
 
 import path from 'path';
 import { CONFIG } from './test-data.js';
@@ -16,9 +14,14 @@ export function reportFileName(batchDateYmd) {
   return `${CONFIG.report.prefix}${batchDateYmd}${CONFIG.report.extension}`;
 }
 
-/** Region independent pattern: *OLSD141R20260922*.txt */
+/**
+ * Any file of the report folder carrying the report ID.
+ * On dev OLSDR141 writes 'OLSD141R_01' (no country code, no date, no extension), while the older
+ * reports (OLSD133R/OLSD134R) write '<env><reportId><batchdate>.txt' - the glob covers both.
+ */
 export function reportFileGlob(batchDateYmd) {
-  return `*${CONFIG.report.reportId}${batchDateYmd}*.txt`;
+  void batchDateYmd;
+  return `*${CONFIG.report.reportId}*`;
 }
 
 /** reports\OLSD141R\<file downloaded from the server> */
@@ -31,41 +34,40 @@ export function reportRemotePath(batchDateYmd) {
   return `${CONFIG.report.remoteDir}/${reportFileName(batchDateYmd)}`;
 }
 
-/** reports\OLSD141R\MYOLSD141R20260922.txt */
-export function reportLocalPath(batchDateYmd) {
-  return path.join(CONFIG.report.localDir, reportFileName(batchDateYmd));
-}
-
 /**
- * Parse the report file name back to its batch date.
- * @returns {{envCode: string|null, batchDate: string}|null}
+ * Parse the report file name. Two layouts exist on dev:
+ *   OLSD141R_01                OLSDR141 output (verified on dev 25/09/2026)
+ *   MYOLSD134R20260922.txt     other reports: <env><reportId><batchdate>.txt
+ * @returns {{name: string, envCode: string|null, batchDate: string|null, sequence: number|null}|null}
  */
 export function parseReportFileName(fileName) {
-  const pattern = new RegExp(
-    `^([A-Za-z]{0,4})${CONFIG.report.reportId}(\\d{8})(?:_\\d{8})?\\${CONFIG.report.extension}$`
-  );
-  const m = String(fileName).trim().match(pattern);
-  return m ? { envCode: m[1] || null, batchDate: m[2] } : null;
+  const name = String(fileName).trim();
+  const id = CONFIG.report.reportId;
+
+  const withDate = name.match(new RegExp(`^([A-Za-z]{0,4})${id}(\\d{8})(?:_\\d{8})?\\${CONFIG.report.extension}$`));
+  if (withDate) return { name, envCode: withDate[1] || null, batchDate: withDate[2], sequence: null };
+
+  const plain = name.match(new RegExp(`^${id}(?:_(\\d{2}))?$`));
+  return plain
+    ? { name, envCode: null, batchDate: null, sequence: plain[1] ? Number(plain[1]) : null }
+    : null;
 }
 
-// ============ OLSMECIF SEED FILE (batch OLSDB057) ============
+// ============ INPUT FILES ============
 
-/** OLSMECIF-20260924-01.dat */
+/** Use the naming convention of the batch: <FILE_ID>-YYYYMMDD-NN.dat */
+function inputFileName(fileId, batchDateYmd, sequenceNo, extension = '.dat') {
+  return `${fileId}-${batchDateYmd}-${String(sequenceNo).padStart(2, '0')}${extension}`;
+}
+
+/** OLSCUST-20260924-01.dat (input of OLSDB012) */
+export function custFileName(batchDateYmd, sequenceNo) {
+  return inputFileName(CONFIG.seedCust.fileId, batchDateYmd, sequenceNo);
+}
+
+/** OLSMECIF-20260924-01.dat (input of OLSDB057) */
 export function mergeFileName(batchDateYmd, sequenceNo) {
-  return `${CONFIG.seed.fileNamePrefix}-${batchDateYmd}-${String(sequenceNo).padStart(2, '0')}` +
-    `${CONFIG.seed.extension}`;
-}
-
-/**
- * Parse OLSMECIF-YYYYMMDD-NN.dat.
- * @returns {{date: string, sequence: number}|null}
- */
-export function parseMergeFileName(fileName) {
-  const pattern = new RegExp(
-    `^${CONFIG.seed.fileNamePrefix}-(\\d{8})-(\\d{2})\\${CONFIG.seed.extension}$`
-  );
-  const m = String(fileName).trim().match(pattern);
-  return m ? { date: m[1], sequence: Number(m[2]) } : null;
+  return inputFileName(CONFIG.seedMerge.fileId, batchDateYmd, sequenceNo);
 }
 
 /** Local staging path (C:\BATCH-OCBC-PW1\src\). */

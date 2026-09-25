@@ -4,59 +4,67 @@
 //
 // Same 4-file pattern as OLSDB024 / OLSD133R / OLSD134R:
 //   test-data.js        : CONFIG + expected query + fixed-width column positions
-//   file-naming.js      : naming for the report file and the OLSMECIF seed file
-//   file-generator.js   : seed data (OLSMECIF -> OLSDB057 -> DWH_TEMP_CIF_MERGE)
+//   file-naming.js      : naming of the two input files and of the report file
+//   file-generator.js   : seed data (OLSCUST -> OLSDB012 -> OLSMECIF -> OLSDB057)
 //   test-runner.spec.js : run the report batch, download + parse the report, compare with DB
 //
 // Flow:
-//   1 PREPARE : OLSMECIF -> upload -> ./OLSDB057
-//   2 CHECK   : DWH_TEMP_CIF_MERGE rows of that job_id
+//   1 PREPARE : 7 new CIFs -> OLSCUST -> ./OLSDB012 -> 7 CLIENT records
+//   2 PREPARE : 4 merge records -> OLSMECIF -> ./OLSDB057 -> DWH_TEMP_CIF_MERGE
 //   3 RUN     : ./OLSDR141 -> MYOLSD141R<batch date>.txt
 //   4 LOAD    : download to reports\OLSD141R\ and parse
 //   5 VERIFY  : query by job_id -> compare -> log [FAIL]
 //
 // Environment flags:
-//   OLSD141R_SKIP_PREPARE=1  skip seeding (reuse existing DB data)
-//   OLSD141R_SKIP_BATCH=1    do not rerun OLSDR141; reuse the report already on the server
-//   OLSD141R_JOB_ID=...      use a specific job_id instead of discovering the newest one
+//   OLSD141R_SKIP_PREPARE=1     skip seeding (reuse existing DB data)
+//   OLSD141R_SKIP_BATCH=1       do not rerun OLSDR141; reuse the report already on the server
+//   OLSD141R_JOB_ID=...         use a specific job_id instead of discovering the newest one
+//   OLSD141R_MERGE_STATUSES=... statuses of the 4 merge records, e.g. "Y,N,Y,Z"
+//   OLSD141R_CUST_ACTION=...    OLSCUST recordAction (default 'A' = add)
 
 import { test, expect } from '@playwright/test';
 import fs from 'fs-extra';
+import crypto from 'crypto';
 import path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import pg from 'pg';
 import {
   CONFIG, SCHEMA, REPORT_ID, TITLE_RE, INDICATOR_DESC, COLUMN_LAYOUT, ROW_LENGTH,
-  FIELD_LABELS, ROW_FIELDS,
+  FIELD_LABELS, ROW_FIELDS, CIF_COUNT, MERGE_PAIRS,
 } from './test-data.js';
 import {
   reportFileName, reportFileGlob, reportLocalPathForName, parseReportFileName,
 } from './file-naming.js';
 import {
-  prepareData, getBatchContext, fetchExpectedRows, resolveJobId,
+  prepareData, getBatchContext, fetchExpectedRows, resolveJobId, findCifsInClient,
 } from './file-generator.js';
 
 const execAsync = promisify(exec);
 
 // ============ DASHBOARD DATA ============
 const STEP_LEGEND = [
-  ['1', 'Build OLSMECIF input file'],
-  ['2', 'Upload file to SFTP (WinSCP)'],
-  ['3', 'Run OLSDB057'],
-  ['4', 'Wait for OLSDB057 to complete'],
-  ['5', 'Wait for OLSDB057 output files'],
-  ['6', 'Check DWH_TEMP_CIF_MERGE rows of this run'],
-  ['10', 'Run OLSDR141'],
-  ['11', 'Wait for OLSD141R report file'],
-  ['12', 'Download report to local'],
-  ['13', 'Parse report'],
-  ['14', 'Compare report vs DB'],
+  ['1', `Generate ${CIF_COUNT} new CIF numbers (checked against CLIENT)`],
+  ['2', 'Build OLSCUST input (recordAction + one detail per CIF)'],
+  ['3', 'Upload OLSCUST to SFTP'],
+  ['4', 'Run OLSDB012'],
+  ['5', 'Wait for OLSDB012 output files'],
+  ['6', `Verify the ${CIF_COUNT} CIFs exist in CLIENT`],
+  ['7', 'Build OLSMECIF input (4 merge records)'],
+  ['8', 'Upload OLSMECIF to SFTP'],
+  ['9', 'Run OLSDB057'],
+  ['10', 'Wait for OLSDB057 output files'],
+  ['11', 'Check DWH_TEMP_CIF_MERGE rows of this run'],
+  ['20', 'Run OLSDR141'],
+  ['21', 'Wait for OLSD141R report file'],
+  ['22', 'Download report to local'],
+  ['23', 'Parse report'],
+  ['24', 'Compare report vs DB'],
 ];
 
 const steps = [];
 const testCaseResults = [];
-const runContext = { batchDateYmd: null, jobId: null };
+const runContext = { batchDateYmd: null, jobId: null, cifs: [], merges: [], report: null };
 let comparison = null;
 let headerCheck = null;
 
@@ -246,6 +254,16 @@ async function downloadReport(fileName, testCase) {
   return localFile;
 }
 
+/** Size + md5 + mtime of the downloaded report - identifies exactly the file of this run. */
+function fileFingerprint(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  return {
+    size: buffer.length,
+    md5: crypto.createHash('md5').update(buffer).digest('hex'),
+    mtime: fs.statSync(filePath).mtime.toISOString(),
+  };
+}
+
 // ============ DATABASE ============
 async function executeDbQuery(query, params = [], testCase = 'DB') {
   const client = new pg.Client({
@@ -256,6 +274,9 @@ async function executeDbQuery(query, params = [], testCase = 'DB') {
     database: CONFIG.database.database,
   });
   await client.connect();
+  // Same convention as scripts/database_helper.js and OLSDB020 (the expected query of the BA uses
+  // unqualified table names).
+  await client.query(`SET search_path TO ${SCHEMA}`);
   try {
     const result = await client.query(query, params);
     return result.rows;
@@ -283,7 +304,7 @@ const TIME_OF_REPORT_RE = /TIME OF REPORT\s*:\s*([\d:]+)/i;   // 2020 build
 const PAGE_RE = /PAGE\s*:\s*(\d+)/i;
 const FILE_NAME_RE = /File Name\s*:\s*(\S+)/i;
 const TOTAL_ACCEPTED_RE = /Total number of records accepted\s*:?\s*(-?[\d.,]+)/i;
-const TOTAL_REJECTED_RE = /Total number of records rejected\s*:\s*(-?[\d.,]+)/i;
+const TOTAL_REJECTED_RE = /Total number of records rejected\s*:?\s*(-?[\d.,]+)/i;
 
 function parseHeader(text) {
   const pick = (re, group = 1) => {
@@ -446,11 +467,12 @@ function recordIdOf(row) {
 }
 
 function logMismatch(mismatch) {
-  log('[FAIL]');
-  log(`  Record: ${mismatch.recordId}`);
+  log('CIF Merge mismatch:');
+  log(`  CIF A: ${mismatch.cifA}`);
+  log(`  CIF B: ${mismatch.cifB}`);
   log(`  Field: ${FIELD_LABELS[mismatch.field] || mismatch.field}`);
-  log(`  Expected (DB): ${mismatch.expected}`);
-  log(`  Actual (report): ${mismatch.actual}`);
+  log(`  Expected: ${mismatch.expected}`);
+  log(`  Actual: ${mismatch.actual}`);
 }
 
 function rowSortKey(row) {
@@ -475,12 +497,13 @@ function compareRows(actualRows, expectedRows) {
     const expected = expectedRows[i];
 
     if (!actual || !expected) {
-      const missing = expected ? recordIdOf(expected) : recordIdOf(actual);
+      const row = expected || actual;
       issues.push(expected
-        ? `Missing row ${i + 1} on the report: DB has ${missing}`
-        : `Extra row ${i + 1} on the report: not in DB (${missing})`);
+        ? `Missing row ${i + 1} on the report: DB has ${recordIdOf(expected)}`
+        : `Extra row ${i + 1} on the report: not in DB (${recordIdOf(actual)})`);
       mismatches.push({
-        recordId: missing,
+        cifA: row.cifA,
+        cifB: row.cifB,
         field: expected ? '(missing row on report)' : '(extra row on report)',
         expected: expected ? JSON.stringify(expected) : '(none)',
         actual: expected ? '(none)' : JSON.stringify(actual),
@@ -488,14 +511,20 @@ function compareRows(actualRows, expectedRows) {
       continue;
     }
 
-    const recordId = recordIdOf(actual);
     if (rowSortKey(actual) !== rowSortKey(expected)) {
-      notes.push(`Order differs at row ${i + 1}: report = ${recordId}, DB = ${recordIdOf(expected)}`);
+      notes.push(`Order differs at row ${i + 1}: report = ${recordIdOf(actual)}, ` +
+        `DB = ${recordIdOf(expected)}`);
     }
 
     for (const field of ROW_FIELDS) {
       if (!fieldMatches(actual[field], expected[field])) {
-        mismatches.push({ recordId, field, expected: expected[field], actual: actual[field] });
+        mismatches.push({
+          cifA: actual.cifA,
+          cifB: actual.cifB,
+          field,
+          expected: expected[field],
+          actual: actual[field],
+        });
       }
     }
   }
@@ -550,7 +579,7 @@ function rowsTable(rows, maxRows = 100) {
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
-function writeDashboard(reportPath, reportFileNameOnServer) {
+function writeDashboard(reportPath, remoteReportName) {
   try {
     fs.ensureDirSync(CONFIG.report.localDir);
     const out = path.join(CONFIG.report.localDir, 'dashboard.html');
@@ -568,6 +597,17 @@ function writeDashboard(reportPath, reportFileNameOnServer) {
     const legendRows = STEP_LEGEND.map(([no, name]) =>
       `<tr><td>${no}</td><td>${escapeHtml(name)}</td></tr>`).join('');
 
+    const cifRows = runContext.cifs.map((cif, i) => {
+      const merge = MERGE_PAIRS[i];
+      void merge;
+      return `<tr><td>cif${i + 1}</td><td>${escapeHtml(cif)}</td></tr>`;
+    }).join('');
+
+    const mergeRows = runContext.merges.map((m, i) =>
+      `<tr><td>${i + 1}</td><td>${escapeHtml(m.cifA)}</td><td>${escapeHtml(m.cifB)}</td>` +
+      `<td>cif${MERGE_PAIRS[i].source} -&gt; cif${MERGE_PAIRS[i].target}</td>` +
+      `<td>${escapeHtml(m.status)}</td></tr>`).join('');
+
     const headerCompare = headerCheck ? `
       <h2>FILE DATE vs PROC DATE</h2>
       <table><thead><tr><th>Source</th><th>Value</th><th>Date (YYYYMMDD)</th></tr></thead><tbody>
@@ -575,6 +615,7 @@ function writeDashboard(reportPath, reportFileNameOnServer) {
         <tr><td>PROC DATE</td><td>${escapeHtml(headerCheck.procDate)} ${escapeHtml(headerCheck.procTime)}</td><td>${escapeHtml(headerCheck.procDateYmd)}</td></tr>
         <tr><td>File Name (report)</td><td>${escapeHtml(headerCheck.fileName)}</td><td>${escapeHtml(headerCheck.fileNameDateYmd)}</td></tr>
         <tr><td>Batch date (DB)</td><td>${escapeHtml(headerCheck.batchDateYmd)}</td><td>${escapeHtml(headerCheck.batchDateYmd)}</td></tr>
+        <tr><td>OLSMECIF input (this run)</td><td>${escapeHtml(headerCheck.mergeFileName || '')}</td><td>${escapeHtml(headerCheck.mergeFileDateYmd || '')}</td></tr>
       </tbody></table>
       <p>${escapeHtml(headerCheck.verdict)}</p>` : '';
 
@@ -603,14 +644,24 @@ function writeDashboard(reportPath, reportFileNameOnServer) {
 <h1>OLSD141R - CIF Merge File Report</h1>
 <p>Batch date: ${escapeHtml(runContext.batchDateYmd || 'n/a')} |
    job_id: ${escapeHtml(runContext.jobId || 'n/a')} |
-   Report file: ${escapeHtml(reportFileNameOnServer || 'n/a')} |
+   Report file: ${escapeHtml(remoteReportName || 'n/a')} |
    Local copy: ${escapeHtml(reportPath || 'n/a')}</p>
+<p>Report artifact: ${escapeHtml(runContext.report ? runContext.report.name : 'n/a')} |
+   size: ${escapeHtml(runContext.report ? runContext.report.size : 'n/a')} bytes |
+   mtime: ${escapeHtml(runContext.report ? runContext.report.mtime : 'n/a')} |
+   md5: ${escapeHtml(runContext.report ? runContext.report.md5 : 'n/a')}</p>
 
 <h2>Steps</h2>
 <table><thead><tr><th>#</th><th>Step</th><th>Result</th><th>Note</th></tr></thead><tbody>${stepRows}</tbody></table>
 
 <h2>Test cases</h2>
 <table><thead><tr><th>ID</th><th>Check</th><th>Result</th><th>Note</th></tr></thead><tbody>${tcRows}</tbody></table>
+
+<h2>CIFs generated by OLSDB012</h2>
+<table><thead><tr><th>Alias</th><th>CIF number</th></tr></thead><tbody>${cifRows}</tbody></table>
+
+<h2>CIF merge records (OLSMECIF)</h2>
+<table><thead><tr><th>#</th><th>CIF# A</th><th>CIF# B</th><th>Rule</th><th>Status sent</th></tr></thead><tbody>${mergeRows}</tbody></table>
 
 ${headerCompare}
 ${compareHtml}
@@ -628,36 +679,36 @@ ${compareHtml}
 
 // ============ TEST SUITE ============
 test.describe('OLSD141R - CIF Merge File Report', () => {
-  let ctx;            // batch date / cut-off
+  let ctx;            // batch date of the run
   let parsed;         // parsed report
   let reportPath;     // local report file
   let remoteReport;   // report file name on the server
+  let seed;           // result of prepareData: cifs, merges, job_id, file names
   let expectedRows;   // DWH_TEMP_CIF_MERGE rows of the run
-  let seedJobId;      // job_id discovered by the seed step
 
   test.beforeAll(async () => {
-    // Two Java batches (OLSDB057 + OLSDR141) need a long runtime
+    // Three Java batches (OLSDB012 + OLSDB057 + OLSDR141) need a long runtime
     test.setTimeout(90 * 60 * 1000);
 
-    log('📋 Step 1: Read batch_date (and cut-off for logging) from DB');
+    log('📋 Step 1: Read batch_date from DB');
     ctx = await getBatchContext('PREFLIGHT');
     runContext.batchDateYmd = ctx.batchDateYmd;
-    log(`📊 batch date = ${ctx.batchDateYmd}, cut-off = ${ctx.cutOffTime} (module ${ctx.cutOffModuleId})`);
-    log('📊 Cut-off is NOT used as a filter - expected data is selected by job_id');
+    log(`📊 batch date = ${ctx.batchDateYmd} (OLSD141R does not use a cut-off time)`);
 
     if (process.env.OLSD141R_SKIP_PREPARE === '1') {
       log('📋 Step 2: Skip seeding (OLSD141R_SKIP_PREPARE=1)');
+      seed = { cifs: [], merges: [], jobId: null };
     } else {
-      log('📋 Step 2: Seed data (OLSMECIF -> OLSDB057)');
-      const prepared = await prepareData('OLSD141R');
-      steps.push(...(prepared.steps || []));
-      seedJobId = prepared.jobId || null;
-      runContext.jobId = seedJobId;
-      if (prepared.ctx) {
-        ctx = prepared.ctx;
+      log('📋 Step 2: Seed data (OLSCUST -> OLSDB012 -> OLSMECIF -> OLSDB057)');
+      seed = await prepareData('OLSD141R');
+      steps.push(...(seed.steps || []));
+      if (seed.ctx) {
+        ctx = seed.ctx;
         runContext.batchDateYmd = ctx.batchDateYmd;
       }
-      log(`[OLSD141R] Seed file ${prepared.fileName} -> job_id ${seedJobId || 'n/a'}`);
+      runContext.cifs = seed.cifs || [];
+      runContext.merges = seed.merges || [];
+      runContext.jobId = seed.jobId || null;
     }
 
     log(`📋 Step 3: Run OLSD141R (find file by glob ${reportFileGlob(ctx.batchDateYmd)})`);
@@ -670,24 +721,27 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
         existing.sort((a, b) => b.mtime - a.mtime);
         remoteReport = existing[0].name;
       }
-      addStep('10', 'Run OLSDR141 batch', false, 'skipped (OLSD141R_SKIP_BATCH=1)');
-      addStep('11', 'Wait for OLSD141R report file', false, `skipped - using ${remoteReport}`);
+      addStep('20', 'Run OLSDR141 batch', false, 'skipped (OLSD141R_SKIP_BATCH=1)');
+      addStep('21', 'Wait for OLSD141R report file', false, `skipped - using ${remoteReport}`);
     } else {
       const before = (await listRemoteReports(ctx.batchDateYmd, 'REPORT')).map((r) => r.signature);
       await executeBatch('REPORT');
-      addStep('10', 'Run OLSDR141 batch', true, `cd ${CONFIG.batch.scriptPath} && ${CONFIG.batch.command}`);
+      addStep('20', 'Run OLSDR141 batch', true, `cd ${CONFIG.batch.scriptPath} && ${CONFIG.batch.command}`);
       const fresh = await waitForFreshReport(ctx.batchDateYmd, before, 'REPORT');
       remoteReport = fresh.name;
-      addStep('11', 'Wait for OLSD141R report file', true,
+      addStep('21', 'Wait for OLSD141R report file', true,
         `${CONFIG.report.remoteDir}/${remoteReport} regenerated (${fresh.size} bytes)`);
     }
 
     log('📋 Step 4: Download the report and parse it');
     reportPath = await downloadReport(remoteReport, 'REPORT');
-    addStep('12', 'Download report to local', true, reportPath);
+    runContext.report = { name: remoteReport, path: reportPath, ...fileFingerprint(reportPath) };
+    addStep('22', 'Download report to local', true,
+      `${remoteReport} | ${runContext.report.size} bytes | mtime ${runContext.report.mtime} | ` +
+      `md5 ${runContext.report.md5} | ${reportPath}`);
 
     parsed = parseReport(fs.readFileSync(reportPath, 'utf8'));
-    addStep('13', 'Parse report (header / detail / summary / footer)', parsed.warnings.length === 0,
+    addStep('23', 'Parse report (header / detail / summary / footer)', parsed.warnings.length === 0,
       `FILE DATE=${parsed.header.fileDate || 'n/a'}, PROC DATE=${parsed.header.procDate || 'n/a'}, ` +
       `File Name=${parsed.header.fileName || 'n/a'}, rows=${parsed.rows.length}, ` +
       `warnings=${parsed.warnings.length}`);
@@ -695,7 +749,7 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     for (const w of parsed.warnings) log(`⚠️ Parser warning: ${w}`);
     log(`[OLSD141R] Actual report records: ${parsed.rows.length}`);
 
-    const resolvedJobId = await resolveJobId(seedJobId, 'PREFLIGHT');
+    const resolvedJobId = await resolveJobId(seed.jobId, 'PREFLIGHT');
     runContext.jobId = resolvedJobId;
     if (resolvedJobId) {
       expectedRows = await fetchExpectedRows(resolvedJobId, 'PREFLIGHT');
@@ -733,8 +787,64 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     expect(issues, `Invalid report structure:\n${issues.join('\n')}`).toEqual([]);
   });
 
+  test('TC02: OLSDB012 created the 7 CIFs used by the merge', async () => {
+    const issues = [];
+
+    if (process.env.OLSD141R_SKIP_PREPARE === '1') {
+      log('⏭️ TC02 skipped (OLSD141R_SKIP_PREPARE=1): no CIFs generated by this run');
+      testCaseResults.push({
+        id: 'TC02', ok: true, label: 'OLSDB012 CIFs', note: 'skipped (OLSD141R_SKIP_PREPARE=1)',
+      });
+      return;
+    }
+
+    if (runContext.cifs.length !== CIF_COUNT) {
+      issues.push(`Expected ${CIF_COUNT} generated CIFs, got ${runContext.cifs.length}`);
+    }
+
+    const unique = new Set(runContext.cifs);
+    if (unique.size !== runContext.cifs.length) {
+      issues.push(`Generated CIFs are not unique: ${runContext.cifs.join(', ')}`);
+    }
+
+    // The CIFs are verified right after OLSDB012 (generator step 6): a successful merge inactivates
+    // the source CIF, so checking CLIENT again after OLSDB057 would report false failures.
+    const found = runContext.cifsFound || [];
+    const missing = runContext.cifs.filter((c) => !found.includes(c));
+    if (missing.length) {
+      issues.push(`${missing.length} CIF(s) not created by ${CONFIG.seedCust.batchId}: ${missing.join(', ')}`);
+    }
+
+    // The OLSMECIF records must reuse exactly these CIFs (no new CIF at step 2).
+    for (const merge of runContext.merges) {
+      if (!runContext.cifs.includes(merge.cifA) || !runContext.cifs.includes(merge.cifB)) {
+        issues.push(`Merge record ${merge.cifA} -> ${merge.cifB} does not reuse the generated CIFs`);
+      }
+    }
+
+    const note = `${runContext.cifs.length} CIF(s), all found in ${SCHEMA}.client: ` +
+      `${runContext.cifs.join(', ')}`;
+    log(`📊 [TC02] ${note}`);
+    for (const issue of issues) log(`⚠️ [TC02] ${issue}`);
+
+    testCaseResults.push({
+      id: 'TC02', ok: issues.length === 0, label: 'OLSDB012 created the CIFs',
+      note: issues.join(' | ') || note,
+    });
+
+    await saveTestResults('TC02-OLSDB012', {
+      success: issues.length === 0,
+      totalRecords: runContext.cifs.length,
+      trueCount: found.length,
+      falseCount: issues.length,
+      details: issues.length ? issues : runContext.cifs,
+    }, { start: 1, end: 1 });
+
+    expect(issues, `OLSDB012 seed invalid:\n${issues.join('\n')}`).toEqual([]);
+  });
+
   // FILE DATE vs PROC DATE (BA request) and the "File Name" line of the header.
-  test('TC02: Header - FILE DATE vs PROC DATE vs File Name', async () => {
+  test('TC03: Header - FILE DATE vs PROC DATE vs File Name', async () => {
     const issues = [];
     const h = parsed.header;
     const ymdOf = (ddmmyyyy) => {
@@ -766,6 +876,12 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
       }
     }
 
+    // The report should reference the OLSMECIF file created by this run.
+    if (seed.mergeFile && h.fileName && h.fileName !== seed.mergeFile) {
+      log(`ℹ️ [TC03] Report File Name (${h.fileName}) differs from this run's OLSMECIF ` +
+        `(${seed.mergeFile})`);
+    }
+
     const sameDate = Boolean(fileDateYmd && procDateYmd && fileDateYmd === procDateYmd);
     const verdict = [
       `FILE DATE=${h.fileDate || '-'} (${fileDateYmd || '-'})`,
@@ -779,18 +895,19 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
       fileDate: h.fileDate || '', fileTime: h.fileTime || '', fileDateYmd: fileDateYmd || '',
       procDate: h.procDate || '', procTime: h.procTime || '', procDateYmd: procDateYmd || '',
       fileName: h.fileName || '', fileNameDateYmd: fileNameDateYmd || '',
+      mergeFileName: seed.mergeFile || '', mergeFileDateYmd: ctx.batchDateYmd,
       batchDateYmd: ctx.batchDateYmd, verdict,
     };
 
-    log(`📊 [TC02] ${verdict}`);
-    for (const issue of issues) log(`⚠️ [TC02] ${issue}`);
+    log(`📊 [TC03] ${verdict}`);
+    for (const issue of issues) log(`⚠️ [TC03] ${issue}`);
     testCaseResults.push({
-      id: 'TC02', ok: issues.length === 0,
+      id: 'TC03', ok: issues.length === 0,
       label: 'Header (FILE DATE vs PROC DATE vs File Name)',
       note: issues.join(' | ') || verdict,
     });
 
-    await saveTestResults('TC02-HEADER', {
+    await saveTestResults('TC03-HEADER', {
       success: issues.length === 0,
       totalRecords: 1,
       trueCount: issues.length === 0 ? 1 : 0,
@@ -801,16 +918,17 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     expect(issues, `Invalid report header:\n${issues.join('\n')}`).toEqual([]);
   });
 
-  test('TC03: Report detail vs DWH_TEMP_CIF_MERGE (by job_id)', async () => {
+  test('TC04: Report detail vs DWH_TEMP_CIF_MERGE (by job_id)', async () => {
     const started = Date.now();
+    const issues = [];
 
     if (!expectedRows) {
-      const issues = ['Cannot resolve the job_id of the OLSDB057 run, so there is no expected ' +
-        'data to compare (set OLSD141R_JOB_ID to validate a specific run)'];
+      issues.push('Cannot resolve the job_id of the OLSDB057 run, so there is no expected data ' +
+        'to compare (set OLSD141R_JOB_ID to validate a specific run)');
       testCaseResults.push({
-        id: 'TC03', ok: false, label: 'Report vs DB (DWH_TEMP_CIF_MERGE)', note: issues[0],
+        id: 'TC04', ok: false, label: 'Report vs DB (DWH_TEMP_CIF_MERGE)', note: issues[0],
       });
-      await saveTestResults('TC03-REPORT-VS-DB', {
+      await saveTestResults('TC04-REPORT-VS-DB', {
         success: false, totalRecords: parsed.rows.length, trueCount: 0,
         falseCount: 1, details: issues,
       }, { start: 1, end: 1 }, Date.now() - started);
@@ -819,22 +937,40 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     }
 
     comparison = compareRows(parsed.rows, expectedRows);
-    addStep('14', 'Compare report vs DWH_TEMP_CIF_MERGE (by job_id)', comparison.success,
+
+    // The report must show exactly the CIF pairs generated by OLSDB012 / sent to OLSDB057.
+    const reportKeys = new Set(parsed.rows.map(rowSortKey));
+    for (const merge of runContext.merges) {
+      const key = `${merge.cifA}|${merge.cifB}`;
+      if (!reportKeys.has(key)) {
+        comparison.issues.push(`CIF Merge ${key} from the OLSMECIF input is missing in the report`);
+        comparison.success = false;
+      }
+    }
+    for (const row of parsed.rows) {
+      if (runContext.cifs.length && !runContext.cifs.includes(normalizeText(row.cifA))) {
+        comparison.issues.push(`Report row ${recordIdOf(row)} does not reference a CIF created ` +
+          'by OLSDB012');
+        comparison.success = false;
+      }
+    }
+
+    addStep('24', 'Compare report vs DWH_TEMP_CIF_MERGE (by job_id)', comparison.success,
       `report=${comparison.actualRecords} rows, DB=${comparison.expectedRecords} rows, ` +
       `mismatched fields=${comparison.mismatchedFields}`);
 
-    log(`📊 [TC03] report = ${comparison.actualRecords} row(s), DB = ${comparison.expectedRecords} row(s), ` +
+    log(`📊 [TC04] report = ${comparison.actualRecords} row(s), DB = ${comparison.expectedRecords} row(s), ` +
       `fields checked = ${comparison.fieldsChecked}, mismatched fields = ${comparison.mismatchedFields}`);
-    for (const note of comparison.notes) log(`ℹ️ [TC03] ${note}`);
-    for (const issue of comparison.issues) log(`⚠️ [TC03] ${issue}`);
+    for (const note of comparison.notes) log(`ℹ️ [TC04] ${note}`);
+    for (const issue of comparison.issues) log(`⚠️ [TC04] ${issue}`);
     log(`[OLSD141R] Validation ${comparison.success ? 'PASSED' : 'FAILED'}`);
 
     testCaseResults.push({
-      id: 'TC03', ok: comparison.success, label: 'Report vs DB (mapping + ordering)',
+      id: 'TC04', ok: comparison.success, label: 'Report vs DB (mapping + ordering)',
       note: `${comparison.mismatchedFields} mismatched field(s), ${comparison.issues.length} count/order issue(s)`,
     });
 
-    await saveTestResults('TC03-REPORT-VS-DB', {
+    await saveTestResults('TC04-REPORT-VS-DB', {
       success: comparison.success,
       totalRecords: comparison.actualRecords,
       trueCount: comparison.matchedFields,
@@ -849,26 +985,26 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     ).toBe(true);
   });
 
-  test('TC04: Successful Indicator / Unsuccessful Error Description are valid', async () => {
+  test('TC05: Successful Indicator / Unsuccessful Error Description are valid', async () => {
     const issues = [];
     const observed = new Map();
 
     for (const row of parsed.rows) {
       const ind = normalizeText(row.indicator).toUpperCase();
       const desc = normalizeText(row.errorDesc);
-      const recordId = recordIdOf(row);
 
       if (!INDICATOR_DESC[ind]) {
-        issues.push(`${recordId}: Successful Indicator "${row.indicator}" is not Y/N/Z`);
+        issues.push(`CIF# A ${row.cifA} | CIF# B ${row.cifB}: Successful Indicator ` +
+          `"${row.indicator}" is not Y/N/Z`);
         continue;
       }
 
       // The description column only accepts the three return-file descriptions. It is NOT
-      // asserted that N prints "Not Successful": the real layout sample (OLSD141R_01.txt) prints
-      // "Successful" on an 'N' row, so the description is validated against DB data in TC03.
+      // asserted that N prints "Not Successful": the BA layout sample prints "Successful" on an
+      // 'N' row, so the description is validated against DB data in TC04.
       if (desc && !KNOWN_DESCRIPTIONS.some((d) => d.toLowerCase() === desc.toLowerCase())) {
-        issues.push(`${recordId}: Unsuccessful Error Description "${desc}" is not one of ` +
-          `${KNOWN_DESCRIPTIONS.join(' / ')}`);
+        issues.push(`CIF# A ${row.cifA} | CIF# B ${row.cifB}: Unsuccessful Error Description ` +
+          `"${desc}" is not one of ${KNOWN_DESCRIPTIONS.join(' / ')}`);
       }
 
       const key = `${ind} -> ${desc || '(blank)'}`;
@@ -876,16 +1012,16 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     }
 
     const mapping = [...observed.entries()].map(([k, n]) => `${k} (${n})`).join('; ');
-    log(`📊 [TC04] Indicator -> Description in the report: ${mapping || '(no rows)'}`);
-    for (const issue of issues) log(`⚠️ [TC04] ${issue}`);
+    log(`📊 [TC05] Indicator -> Description in the report: ${mapping || '(no rows)'}`);
+    for (const issue of issues) log(`⚠️ [TC05] ${issue}`);
 
     testCaseResults.push({
-      id: 'TC04', ok: issues.length === 0,
+      id: 'TC05', ok: issues.length === 0,
       label: 'Successful Indicator / Error Description valid',
       note: issues.join(' | ') || `${parsed.rows.length} row(s) | ${mapping}`,
     });
 
-    await saveTestResults('TC04-INDICATOR', {
+    await saveTestResults('TC05-INDICATOR', {
       success: issues.length === 0,
       totalRecords: parsed.rows.length,
       trueCount: parsed.rows.length - issues.length,
@@ -896,22 +1032,23 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     expect(issues, `Invalid indicator/error description:\n${issues.join('\n')}`).toEqual([]);
   });
 
-  test('TC05: Summary - accepted / rejected totals', async () => {
+  test('TC06: Summary - accepted / rejected totals', async () => {
     const issues = [];
-    const counts = countByIndicator(parsed.rows);
-    const expectedAccepted = counts.Y;
-    const expectedRejected = counts.N + counts.Z;
+    // Accepted/rejected is derived from the Error Code column, not from the Successful Indicator:
+    // verified with job 34691 - the report prints 4 rows with Indicator 'Y' but counts
+    // 3 accepted / 1 rejected, matching the rows that carry an error (EB930 - source cif is
+    // processing). A rejected record has valid='0' + error_code/error_message in the DB.
+    const hasError = (row) => normalizeText(row.errorCode) !== '';
+    const expectedAccepted = parsed.rows.filter((row) => !hasError(row)).length;
+    const expectedRejected = parsed.rows.filter(hasError).length;
 
-    if (counts.other.length) {
-      issues.push(`${counts.other.length} row(s) without a valid Successful Indicator`);
-    }
     if (parsed.totals.accepted === null) issues.push('Missing "Total number of records accepted"');
     else if (!sameNumber(parsed.totals.accepted, expectedAccepted)) {
-      issues.push(`Report total accepted = ${parsed.totals.accepted}, Indicator=Y rows = ${expectedAccepted}`);
+      issues.push(`Report total accepted = ${parsed.totals.accepted}, rows without error = ${expectedAccepted}`);
     }
     if (parsed.totals.rejected === null) issues.push('Missing "Total number of records rejected"');
     else if (!sameNumber(parsed.totals.rejected, expectedRejected)) {
-      issues.push(`Report total rejected = ${parsed.totals.rejected}, Indicator=N/Z rows = ${expectedRejected}`);
+      issues.push(`Report total rejected = ${parsed.totals.rejected}, rows with error = ${expectedRejected}`);
     }
 
     // total detail records = accepted + rejected
@@ -932,15 +1069,15 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
 
     const note = `accepted=${parsed.totals.accepted}/${expectedAccepted} (Y), ` +
       `rejected=${parsed.totals.rejected}/${expectedRejected} (N+Z), detail rows=${parsed.rows.length}`;
-    log(`📊 [TC05] ${note}`);
-    for (const issue of issues) log(`⚠️ [TC05] ${issue}`);
+    log(`📊 [TC06] ${note}`);
+    for (const issue of issues) log(`⚠️ [TC06] ${issue}`);
 
     testCaseResults.push({
-      id: 'TC05', ok: issues.length === 0, label: 'Summary accepted / rejected totals',
+      id: 'TC06', ok: issues.length === 0, label: 'Summary accepted / rejected totals',
       note: issues.join(' | ') || note,
     });
 
-    await saveTestResults('TC05-SUMMARY', {
+    await saveTestResults('TC06-SUMMARY', {
       success: issues.length === 0,
       totalRecords: parsed.rows.length,
       trueCount: Math.max(0, 3 - issues.length),
@@ -951,7 +1088,7 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     expect(issues, `Invalid summary:\n${issues.join('\n')}`).toEqual([]);
   });
 
-  test('TC06: Sort sequence by CIF#', async () => {
+  test('TC07: Sort sequence by CIF#', async () => {
     const issues = [];
     const keys = parsed.rows.map(rowSortKey);
     const sorted = [...keys].sort();
@@ -963,14 +1100,14 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
       }
     }
 
-    for (const issue of issues) log(`⚠️ [TC06] ${issue}`);
+    for (const issue of issues) log(`⚠️ [TC07] ${issue}`);
 
     testCaseResults.push({
-      id: 'TC06', ok: issues.length === 0, label: 'Sort sequence by CIF#',
+      id: 'TC07', ok: issues.length === 0, label: 'Sort sequence by CIF#',
       note: issues.join(' | ') || `${keys.length} row(s) sorted ascending by CIF#`,
     });
 
-    await saveTestResults('TC06-SORT', {
+    await saveTestResults('TC07-SORT', {
       success: issues.length === 0,
       totalRecords: keys.length,
       trueCount: keys.length - issues.length,

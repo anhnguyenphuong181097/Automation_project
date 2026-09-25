@@ -1,15 +1,15 @@
 // scripts/OLSD141R/test-data.js
 // Test data + configuration for report OLSD141R "CIF Merge File Report".
 //
-// The report has no input file: it reads DWH_TEMP_CIF_MERGE, written by the CIF Merge batch
-// OLSDB057 (confirmed with the BA):
-//   OLSMECIF-YYYYMMDD-NN.dat -> OLSDB057 -> DWH_TEMP_CIF_MERGE -> OLSDR141 -> OLSD141R report
+// Flow (BA requirement):
+//   OLSCUST (7 new CIFs) -> OLSDB012 -> 7 CLIENT records
+//     -> OLSMECIF (4 merge records, CIF# A -> CIF# B) -> OLSDB057 -> DWH_TEMP_CIF_MERGE
+//     -> OLSDR141 -> OLSD141R report
 //
 // CONFIG lives here (not in the spec) because both the seed step and the spec need it - same
 // approach as OLSD133R / OLSD134R.
 // DO NOT import config/test-config.js (it calls dotenv.config() and overrides BATCH_COMMAND with
-// the non-existent process_batch.sh - AGENTS.md 6.1). Credentials are read from .env, never
-// hard-coded (AGENTS.md 3.1).
+// the non-existent process_batch.sh - AGENTS.md 6.1). Credentials come from .env (AGENTS.md 3.1).
 
 import fs from 'fs';
 import path from 'path';
@@ -42,9 +42,6 @@ export const CONFIG = {
     port: '22',
     username: cred('SFTP_USERNAME', 'root'),
     password: cred('SFTP_PASSWORD', ''),
-    // Input folder of OLSDB057 - the OLSMECIF file is uploaded here.
-    // TODO: confirm the dev path (override with OLSD141R_SEED_REMOTE_PATH).
-    remotePath: process.env.OLSD141R_SEED_REMOTE_PATH || '/apps/MY-dev/OE/cls/USER_INPUT/OLSDB057/',
     localPath: cred('LOCAL_PATH', 'C:\\BATCH-OCBC-PW1\\src\\'),
   },
 
@@ -60,20 +57,37 @@ export const CONFIG = {
 
   batch: {
     scriptPath: '/apps/MY-dev/scripts',
-    // Batch = OLSDR141, report ID / file name = OLSD141R
+    // Report batch = OLSDR141, report ID / file name = OLSD141R
     command: './OLSDR141',
     // Java batch: allow JVM startup time (AGENTS.md 4.5)
     timeout: 600000,
   },
 
-  // Upstream batch that creates the report data
-  seed: {
+  // Step 1: customer maintenance - creates the CIFs used by the merge
+  seedCust: {
+    batchId: 'OLSDB012',
+    fileId: 'OLSCUST',
+    receivingSystem: 'OLS',
+    // TODO: confirm the dev input folder (EOD flow row 12 lists OLSDB012 with OLSCUST).
+    remotePath: process.env.OLSD141R_CUST_REMOTE_PATH || '/apps/MY-dev/OE/cls/USER_INPUT/OLSDB012/',
+    seedDir: path.join(PROJECT_ROOT, 'scripts', 'test-data', 'generated', 'OLSD141R', 'seed-cust'),
+  },
+
+  // Step 2: CIF merge - creates DWH_TEMP_CIF_MERGE rows read by the report
+  seedMerge: {
     batchId: 'OLSDB057',
-    scriptPath: '/apps/MY-dev/scripts',
     fileId: 'OLSMECIF',
-    fileNamePrefix: 'OLSMECIF',
-    extension: '.dat',
-    seedDir: path.join(PROJECT_ROOT, 'scripts', 'test-data', 'generated', 'OLSD141R', 'seed'),
+    // TODO: confirm the dev input folder (SG EOD flow row 18 = OLSDB057 CIF Merge Process).
+    remotePath: process.env.OLSD141R_MERGE_REMOTE_PATH || '/apps/MY-dev/OE/cls/USER_INPUT/OLSDB057/',
+    seedDir: path.join(PROJECT_ROOT, 'scripts', 'test-data', 'generated', 'OLSD141R', 'seed-merge'),
+  },
+
+  // Sample files provided by the BA - used as the layout template of the generated input files
+  // (only the fields listed in MERGE_PAIRS / CIF numbers are patched).
+  // The samples are not copied into the repo; override the paths if they move.
+  templates: {
+    olscust: process.env.OLSD141R_CUST_TEMPLATE || 'F:\\OCBC\\OLSCUST-20260728-01.dat',
+    olmecif: process.env.OLSD141R_MECIF_TEMPLATE || 'F:\\OCBC\\OLSMECIF-20260907-01.dat',
   },
 
   report: {
@@ -85,7 +99,7 @@ export const CONFIG = {
     prefix: 'MYOLSD141R',
     extension: '.txt',
     localDir: path.join(PROJECT_ROOT, 'reports', 'OLSD141R'),
-    // "File Name" printed in the report header
+    // "File Name" printed in the report header = the OLSMECIF file processed by OLSDB057
     fileNamePrefix: 'OLSMECIF',
   },
 
@@ -96,6 +110,8 @@ export const CONFIG = {
     username: cred('DB_USERNAME', 'ols_user'),
     password: cred('DB_PASSWORD', ''),
     schema: 'ols_schema',
+    // Column of ols_schema.client that holds the CIF number (confirmed with the BA).
+    cifColumn: 'external_reference_no',
   },
 };
 
@@ -107,12 +123,43 @@ export const REPORT_ID = 'OLSD141R';
 // 2020 build (report spec section 23)     : 'CIF MERGE FILE REPORT (OLSD141R)'
 export const TITLE_RE = /CIF\s+MERGE\s+FILE\s+REPORT/i;
 
-// module_id in oe_cutofftime_control. The BA removed the cut-off condition from this validation
-// turn, so it is only read for logging - expected data is selected by the OLSDB057 job_id.
-export const CUTOFF_MODULE_IDS = ['OLSDR141'];
+// No cut-off time is used for OLSD141R (confirmed with the BA). The expected data of one run is
+// selected by the job_id of that OLSDB057 run - see EXPECTED_QUERY.
 
 // Report spec section 23: Y = Successful, N = Not Successful, Z = Not Found.
+// The same descriptions are used by the OLSMECIF "Unsuccessful Error Description" field.
 export const INDICATOR_DESC = { Y: 'Successful', N: 'Not Successful', Z: 'Not Found' };
+
+// ============ CIF MERGE RECORDS (STEP 2) ============
+// 7 CIFs are created by OLSDB012 and referenced by index (1..7 = cif1..cif7).
+export const CIF_COUNT = 7;
+
+// Merge records required by the BA: CIF1->CIF2, CIF2->CIF3, CIF4->CIF5, CIF6->CIF7.
+// Source/old CIF -> CIF# A, target/new CIF -> CIF# B.
+export const MERGE_PAIRS = [
+  { source: 1, target: 2 },
+  { source: 2, target: 3 },
+  { source: 4, target: 5 },
+  { source: 6, target: 7 },
+];
+
+// Successful Indicator written into the OLSMECIF records.
+// The BA did not define which merge record gets Y/N/Z, so the value is configurable:
+//   OLSD141R_MERGE_STATUSES="Y,N,Y,Z" (one letter per merge record)
+// Default: every record is sent as 'Y'.
+export const MERGE_STATUSES = (process.env.OLSD141R_MERGE_STATUSES || '')
+  .split(',')
+  .map((s) => s.trim().toUpperCase())
+  .filter((s) => s in INDICATOR_DESC);
+
+/** Status of merge record i (0-based); falls back to 'Y'. */
+export function mergeStatusOf(index) {
+  return MERGE_STATUSES[index] || 'Y';
+}
+
+// recordAction of the OLSCUST detail records: 'A' (Add) - confirmed with the BA, the flow creates
+// 7 new CIFs. The provided sample carries 'D' (delete), which is not used.
+export const CUST_ACTION = 'A';
 
 // ============ REPORT COLUMN LAYOUT (fixed width, 413 chars per printed line) ============
 // Measured on the real layout file OLSD141R_01.txt. Declared widths: X(19) / X(35) / X(35) /
@@ -175,13 +222,14 @@ export const EXPECTED_QUERY = `
 
 // ============ OLSMECIF INPUT FILE (340 chars per record) ============
 // OLS Batch Interface (Input to OLS) Specifications v1.75, section 2.12 "OLSMECIF - CIF Merge".
+// Verified field by field against the sample OLSMECIF-20260907-01.dat.
 // Header A + Processing Date X(8) + Filler X(331); Trailer T + Total records 9(5) + Filler X(334).
 // OLS ignores every detail field except the two CIF numbers.
 export const MERGE_FILE_LAYOUT = {
   recordLength: 340,
   header: [
     ['recordType', 1],      // 'A'
-    ['processingDate', 8],  // YYYYMMDD
+    ['processingDate', 8],  // DDMMYYYY (sample: '15082026' for file OLSMECIF-20260907-01.dat)
     ['filler', 331],
   ],
   detail: [
@@ -203,19 +251,29 @@ export const MERGE_FILE_LAYOUT = {
     ['createDate', 7],
     ['createDateDmy', 6],
     ['createTime', 6],
-    ['successfulIndicator', 1],    // ignored on input
-    ['unsuccessfulErrorDesc', 40], // ignored on input
+    ['successfulIndicator', 1],    // Y / N / Z (ignored by OLS on input)
+    ['unsuccessfulErrorDesc', 40], // Successful / Not Successful / Not Found
     ['corpPersonalIndicator', 1],  // C = Corporate, P = Personal
     ['filler', 10],
   ],
   trailer: [
     ['recordType', 1],      // 'T'
-    ['totalRecords', 5],
+    ['totalRecords', 5],    // header + details + trailer
     ['filler', 334],
   ],
 };
 
-/** Total length of a record definition - asserts the 340-char contract. */
-export function recordLengthOf(fields) {
-  return fields.reduce((total, [, width]) => total + width, 0);
-}
+// ============ OLSCUST INPUT FILE (pipe delimited) ============
+// OLS Batch Interface (Input to OLS) Specifications v1.75, section 2.3 "OLSCUST".
+// The generated file is cloned from the sample, so only the cells below are patched:
+//   HD : createDate (X(08) YYYYMMDD) + fileNumber 9(04)
+//   DT : recordAction X(01) + custCifNbr X(19)     <- cloned once per generated CIF
+//   TR : recordCount 9(10) = number of records in the file (header + trailer included)
+// The DT/TR cells are located through the FN|DT / FN|TR rows of the sample itself.
+export const CUST_FIELDS = {
+  detail: { action: 'recordAction', cif: 'custCifNbr' },
+  trailer: { count: 'recordCount' },
+  // The value cells of a DT record are shifted by 1 against the FN|DT name row (the name row
+  // carries the extra 'FN' cell), so valueIndex = nameIndex - 1.
+  dtValueOffset: -1,
+};

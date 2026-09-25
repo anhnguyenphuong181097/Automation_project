@@ -1,9 +1,13 @@
 // scripts/OLSD141R/file-generator.js
-// Prepare the input data for report OLSD141R ("CIF Merge File Report").
+// Prepare the input data of the OLSD141R report ("CIF Merge File Report"):
 //
-//   OLSMECIF-YYYYMMDD-NN.dat (built here, 340-char records)
-//     -> copy to src\ -> upload via SFTP -> run ./OLSDB057 (CIF Merge Process)
-//     -> DWH_TEMP_CIF_MERGE rows of this job_id -> OLSD141R expected data
+//   OLSCUST (7 new CIFs) -> OLSDB012 -> 7 CLIENT records
+//     -> OLSMECIF (4 merge records) -> OLSDB057 -> DWH_TEMP_CIF_MERGE
+//     -> OLSDR141 expected data (query provided by the BA)
+//
+// Both input files are cloned from the BA samples (CONFIG.templates): only the CIF numbers,
+// the OLSCUST recordAction / dates and the OLSMECIF statuses are patched, so the layout of the
+// sample files is preserved byte for byte.
 //
 // Manual run: node scripts/OLSD141R/file-generator.js (also called by test.beforeAll)
 
@@ -14,18 +18,18 @@ import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import pg from 'pg';
 import {
-  CONFIG, SCHEMA, CUTOFF_MODULE_IDS, MERGE_FILE_LAYOUT, EXPECTED_QUERY, recordLengthOf,
+  CONFIG, SCHEMA, CIF_COUNT, MERGE_PAIRS, INDICATOR_DESC, mergeStatusOf,
+  CUST_ACTION, CUST_FIELDS, MERGE_FILE_LAYOUT, EXPECTED_QUERY,
 } from './test-data.js';
-import { mergeFileName, stagingPath } from './file-naming.js';
+import { custFileName, mergeFileName, stagingPath } from './file-naming.js';
 
 const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const EOL = '\r\n';
 
 // ============ HELPERS ============
 function log(message, data = {}) {
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${message}`, Object.keys(data).length ? data : '');
+  console.log(`[${timestamp}] ${message}`, Object.keys(data).length ? data : {});
 }
 
 // child_process errors may include the full command, including -pw <password>.
@@ -47,7 +51,7 @@ function plinkCommand(remoteCommand) {
 }
 
 /** Run one batch: cd <scriptPath> && ./<batchId>. Throws if the command cannot run at all. */
-async function runRemoteBatch(batchId, testCase = batchId) {
+export async function runRemoteBatch(batchId, testCase = batchId) {
   const command = `cd ${CONFIG.batch.scriptPath} && ./${batchId}`;
   log(`[${testCase}] Run batch: ${command}`);
 
@@ -66,21 +70,23 @@ async function runRemoteBatch(batchId, testCase = batchId) {
   }
 }
 
-async function uploadFiles(fileNames, testCase = 'OLSDB057') {
+async function uploadFiles(fileNames, remotePath, testCase) {
   for (const name of fileNames) {
     const command = `"${CONFIG.winscp.path}" /command ` +
       `"option batch abort" ` +
       `"option confirm off" ` +
+      `"option transfer binary" ` +
       `"open sftp://${CONFIG.winscp.username}:${CONFIG.winscp.password}@${CONFIG.winscp.host}/" ` +
-      `"cd ${CONFIG.winscp.remotePath}" ` +
+      `"cd ${remotePath}" ` +
       `"put ""${stagingPath(name)}""" ` +
       `"exit"`;
 
     try {
       await execAsync(command, { timeout: 60000, maxBuffer: 1024 * 1024 * 10 });
-      log(`[${testCase}] Upload OK: ${name}`);
+      log(`[${testCase}] Upload OK: ${name} -> ${remotePath}`);
     } catch (error) {
-      throw new Error(`[${testCase}] Upload failed ${name}: ${maskSecret(error.message)}`);
+      throw new Error(`[${testCase}] Upload failed ${name} to ${remotePath}: ` +
+        `${maskSecret(error.message)}`);
     }
   }
 }
@@ -105,6 +111,10 @@ async function getDbConnection() {
     database: CONFIG.database.database,
   });
   await client.connect();
+  // Same convention as scripts/database_helper.js and OLSDB020: the expected-data query provided
+  // by the BA uses unqualified table names (dwh_temp_cif_merge), so the schema must be on the
+  // connection's search_path.
+  await client.query(`SET search_path TO ${SCHEMA}`);
   return client;
 }
 
@@ -141,19 +151,11 @@ function toIsoDate(value) {
   return ymd.length === 8 ? `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}` : s;
 }
 
-function normalizeCutOff(value) {
-  if (value === null || value === undefined) return null;
-  const s = String(value).trim();
-  if (!s) return null;
-  const m = s.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-  if (m) return `${m[1].padStart(2, '0')}:${m[2]}:${m[3] || '00'}`;
-  const digits = s.replace(/\D/g, '');
-  return digits.length === 6
-    ? `${digits.slice(0, 2)}:${digits.slice(2, 4)}:${digits.slice(4, 6)}`
-    : s;
-}
-
-/** Batch date (batch_date.batch_date) + cut-off of module OLSDR141 (logging only). */
+/**
+ * Batch date of the current run (ols_schema.batch_date.batch_date).
+ * OLSD141R needs no cut-off time: the data of this run is identified by the job_id of the
+ * OLSDB057 run (see resolveJobId).
+ */
 export async function getBatchContext(testCase = 'OLSD141R') {
   const batchRows = await executeDbQuery(
     `SELECT batch_date FROM ${SCHEMA}.batch_date ORDER BY batch_date DESC LIMIT 1`,
@@ -163,74 +165,144 @@ export async function getBatchContext(testCase = 'OLSD141R') {
   if (!batchRows.length) throw new Error(`[${testCase}] Table ${SCHEMA}.batch_date has no row.`);
 
   const batchDate = toIsoDate(batchRows[0].batch_date);
-  const cutoffRows = await executeDbQuery(
-    `SELECT module_id, current_cutoff_time, control_cutoff_time
-       FROM ${SCHEMA}.oe_cutofftime_control WHERE module_id = ANY($1)`,
-    [CUTOFF_MODULE_IDS],
-    testCase
-  );
-
-  const picked = cutoffRows.find(
-    (r) => String(r.module_id).trim() === CUTOFF_MODULE_IDS[0]
-  ) || null;
-  const cutOffTime = picked
-    ? normalizeCutOff(picked.control_cutoff_time || picked.current_cutoff_time) || '23:59:59'
-    : '23:59:59';
-
-  return {
-    batchDate,
-    batchDateYmd: toYmd(batchDate),
-    cutOffTime,
-    cutOffModuleId: picked ? String(picked.module_id).trim() : '(no cut-off row)',
-  };
+  return { batchDate, batchDateYmd: toYmd(batchDate) };
 }
 
-// ============ OLSMECIF FILE BUILDER ============
-/** Pad/truncate a fixed-length field (left aligned, blank padded). */
-function cell(value, width) {
-  const s = value === null || value === undefined ? '' : String(value);
-  return s.length > width ? s.slice(0, width) : s.padEnd(width);
+// ============ TEMPLATES ============
+/** Read a BA sample and keep its line ending / trailing newline untouched. */
+function loadTemplate(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(
+      `Sample file not found: ${filePath}\n` +
+      `Set OLSD141R_CUST_TEMPLATE / OLSD141R_MECIF_TEMPLATE to the sample locations.`
+    );
+  }
+  const text = fs.readFileSync(filePath, 'utf8');
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const trailingEol = /\r?\n$/.test(text);
+  const lines = text.split(/\r?\n/);
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  return { path: filePath, eol, trailingEol, lines };
 }
 
-function buildRecord(definition, values) {
-  return `${definition.map(([name, width]) => cell(values[name], width)).join('')}${EOL}`;
+function renderTemplate(template, lines) {
+  return lines.join(template.eol) + (template.trailingEol ? template.eol : '');
+}
+
+// ============ OLSCUST BUILDER (OLSDB012 input) ============
+/**
+ * Clone the OLSCUST sample into one file with a detail record per generated CIF.
+ * Only the DT recordAction / custCifNbr cells, the HD createDate / fileNumber cells and the TR
+ * recordCount cell are patched - every other cell keeps the sample value.
+ */
+export function buildCustFile({ template, cifs, action = CUST_ACTION, createDate, fileNumber }) {
+  const nameCells = (template.lines.find((l) => l.startsWith('FN|DT|')) || '').split('|');
+  const valueIndex = (name) => nameCells.indexOf(name) + CUST_FIELDS.dtValueOffset;
+  const cifIdx = valueIndex(CUST_FIELDS.detail.cif);
+  const actionIdx = valueIndex(CUST_FIELDS.detail.action);
+
+  if (cifIdx < 0 || actionIdx < 0) {
+    throw new Error(`Cannot locate ${CUST_FIELDS.detail.cif} / ${CUST_FIELDS.detail.action} ` +
+      `in the FN|DT row of ${template.path}`);
+  }
+
+  const dtTemplate = template.lines.find((l) => l.startsWith('DT|'));
+  if (!dtTemplate) throw new Error(`No DT record in the OLSCUST sample ${template.path}`);
+
+  const hdIdx = template.lines.findIndex((l) => l.startsWith('HD|'));
+  const trIdx = template.lines.findIndex((l) => l.startsWith('TR|'));
+  const dtIdx = template.lines.indexOf(dtTemplate);
+
+  const details = cifs.map((cif) => {
+    const cells = dtTemplate.split('|');
+    cells[actionIdx] = action;
+    cells[cifIdx] = cif;
+    return cells.join('|');
+  });
+
+  const recordCount = cifs.length + template.lines.length - 1; // header + FN rows + trailer included
+  const out = template.lines.slice();
+  out[dtIdx] = details.join(template.eol);
+  if (hdIdx >= 0) {
+    const hd = out[hdIdx].split('|');
+    hd[3] = createDate;               // createDate X(08) YYYYMMDD
+    // fileNumber 9(04): the OLSCUST files accepted by OLSDB012 on dev use '0020' (4 digits),
+    // while the BA sample carries '1' - follow the accepted files.
+    hd[5] = String(fileNumber).padStart(4, '0');
+    out[hdIdx] = hd.join('|');
+  }
+  if (trIdx >= 0) {
+    const tr = out[trIdx].split('|');
+    let countIdx = -1;
+    tr.forEach((cell, i) => { if (/^\d{10}$/.test(cell)) countIdx = i; }); // last 10-digit cell
+    if (countIdx >= 0) tr[countIdx] = String(recordCount).padStart(10, '0');
+    out[trIdx] = tr.join('|');
+  }
+
+  return { content: renderTemplate(template, out), recordCount, cifIdx, actionIdx };
+}
+
+// ============ OLSMECIF BUILDER (OLSDB057 input) ============
+/** Write one fixed-width cell (left aligned, blank padded). */
+function patchFixedWidth(line, fields, values) {
+  let out = line.padEnd(MERGE_FILE_LAYOUT.recordLength, ' ');
+  let pos = 0;
+  for (const [name, width] of fields) {
+    if (values[name] !== undefined) {
+      const value = String(values[name]).slice(0, width).padEnd(width, ' ');
+      out = out.slice(0, pos) + value + out.slice(pos + width);
+    }
+    pos += width;
+  }
+  return out;
 }
 
 /**
- * Build the whole OLSMECIF file: header + one detail per merge instruction + trailer.
- * The trailer counter is the total number of records in the file.
+ * Clone the OLSMECIF sample into one file with a detail record per merge pair.
+ * Only the two CIF numbers, the Successful Indicator and the status description are patched;
+ * positions, lengths and every following field stay exactly as in the sample.
  */
-function buildMergeFile({ processingDateYmd, details }) {
-  const lines = [buildRecord(MERGE_FILE_LAYOUT.header, {
-    recordType: 'A', processingDate: processingDateYmd,
-  })];
-  for (const detail of details) {
-    lines.push(buildRecord(MERGE_FILE_LAYOUT.detail, { recordType: 'D', ...detail }));
+export function buildMergeFile({ template, merges, processingDate }) {
+  const header = template.lines.find((l) => l.startsWith('A'));
+  const detail = template.lines.find((l) => l.startsWith('D'));
+  const trailer = template.lines.find((l) => l.startsWith('T'));
+  if (!header || !detail || !trailer) {
+    throw new Error(`Unexpected OLSMECIF sample layout: ${template.path}`);
   }
-  lines.push(buildRecord(MERGE_FILE_LAYOUT.trailer, {
-    recordType: 'T', totalRecords: String(lines.length + 1).padStart(5, '0'),
+
+  const details = merges.map((m) => patchFixedWidth(detail, MERGE_FILE_LAYOUT.detail, {
+    cifNumberA: m.cifA,
+    cifNumberB: m.cifB,
+    successfulIndicator: m.status,
+    unsuccessfulErrorDesc: INDICATOR_DESC[m.status] || INDICATOR_DESC.Y,
   }));
-  return lines.join('');
+
+  const patchedHeader = processingDate
+    ? patchFixedWidth(header, MERGE_FILE_LAYOUT.header, { processingDate })
+    : header;
+  const patchedTrailer = patchFixedWidth(trailer, MERGE_FILE_LAYOUT.trailer, {
+    totalRecords: String(details.length + 2).padStart(5, '0'), // header + details + trailer
+  });
+
+  return { content: renderTemplate(template, [patchedHeader, ...details, patchedTrailer]) };
 }
 
 // ============ LEDGER CHECKS (BE051 / BE302) ============
 /**
- * Next free file number for (file_id + source_create_date) - the same rule that produced BE302
- * for OLSTXN. TODO: confirm that OLSDB057 writes batch_header rows with file_id = 'OLSMECIF';
- * if it does not, this returns 1 and the isFileNameUsed() loop below still finds a free number.
+ * Next free file number for (file_id + source_create_date). File names already present in
+ * batch_resource are rejected with BE051, so the caller loops until isFileNameUsed() is false.
  */
-async function getNextFileNumber(isoCreateDate, testCase = 'OLSD141R') {
+async function getNextFileNumber(fileId, isoCreateDate, testCase = 'OLSD141R') {
   const rows = await executeDbQuery(
     `SELECT MAX(NULLIF(regexp_replace(file_number, '\\D', '', 'g'), '')::bigint) AS max_no
        FROM ${SCHEMA}.batch_header
       WHERE file_id = $1 AND source_create_date::date = $2::date`,
-    [CONFIG.seed.fileId, isoCreateDate],
+    [fileId, isoCreateDate],
     testCase
-  );
+  ).catch(() => []);
   return (rows.length && rows[0].max_no ? Number(rows[0].max_no) : 0) + 1;
 }
 
-/** A file name already present in the ledger is rejected with BE051 (AGENTS.md 4.1). */
 async function isFileNameUsed(fileName, testCase = 'OLSD141R') {
   const rows = await executeDbQuery(
     `SELECT 1 FROM ${SCHEMA}.batch_resource WHERE logical_filename = $1 LIMIT 1`,
@@ -240,61 +312,119 @@ async function isFileNameUsed(fileName, testCase = 'OLSD141R') {
   return rows.length > 0;
 }
 
-// ============ SEED DATA ============
-/** 19-digit CIF that must not exist yet, used as the "new" CIF of the merge. */
-function syntheticUnusedCif(cifA) {
-  const base = String(cifA).replace(/\D/g, '').padStart(19, '0').slice(-19);
-  const tail = ((Number(base.slice(15)) + 7) % 10000).toString().padStart(4, '0');
-  return `${base.slice(0, 15)}${tail}`;
+/** Next free sequence for <FILE_ID>-<date>-NN.dat (AGENTS.md 4.1). */
+async function nextFreeSequence(fileId, batchDateYmd, nameBuilder, testCase = 'OLSD141R') {
+  const isoDate = `${batchDateYmd.slice(0, 4)}-${batchDateYmd.slice(4, 6)}-${batchDateYmd.slice(6, 8)}`;
+  let seq = await getNextFileNumber(fileId, isoDate, testCase);
+  for (;;) {
+    const candidate = nameBuilder(seq);
+    if (!(await isFileNameUsed(candidate, testCase))) return { seq, fileName: candidate };
+    seq += 1;
+  }
 }
 
 /**
- * Pick the CIF pair of the merge instruction (interface spec section 2.12):
- *   CIF A not found                -> 'Z' (Not Found)
- *   CIF A found, CIF B not found   -> inactivate A, copy A to B -> 'Y'
- *   both found                     -> accounts of A move to B   -> 'Y'
- * Default: an existing CIF A + a synthetic CIF B (the normal successful merge).
+ * Processing Date of the OLSMECIF header (DDMMYYYY).
  *
- * TODO: confirm the source of the seed CIF with dev. Priority:
- *   1. OLSD141R_CIF_A / OLSD141R_CIF_B, or
- *   2. CLIENT.external_reference_no (column name not confirmed - set
- *      OLSD141R_SKIP_CIF_DISCOVERY=1 to disable this query).
+ * Two rules were confirmed from the job error log (<FILE>_<pid>_<date>.err) of OLSDB057:
+ *   "Duplicate file processed with same date 2026-09-25"        -> the date must not repeat
+ *   "CreateDate 2026-09-24 is before last run date of 2026-09-25" -> it must be later than the
+ *                                                                   last received file
+ * The real dev files follow the same pattern, one day per file:
+ *   OLSMECIF-20260903-02 -> CreateDate 12/08/2026, OLSMECIF-20260903-03 -> 13/08/2026.
+ * batch_header (file_id = OLSMECIF) is the ledger of received files (it also records rejected
+ * ones), so the next CreateDate = max(batch date, MAX(source_create_date) + 1 day).
+ * Override with OLSD141R_PROCESSING_DATE.
  */
-async function resolveMergeCifPair(testCase = 'OLSD141R') {
-  const envA = process.env.OLSD141R_CIF_A || null;
-  const envB = process.env.OLSD141R_CIF_B || null;
-  if (envA) {
-    log(`[${testCase}] Seed CIF pair from environment: A=${envA}, B=${envB || '(synthetic)'}`);
-    return { cifA: envA, cifB: envB || syntheticUnusedCif(envA) };
-  }
-  if (process.env.OLSD141R_SKIP_CIF_DISCOVERY === '1') {
-    throw new Error(`[${testCase}] Set OLSD141R_CIF_A (CIF discovery is disabled).`);
+async function resolveProcessingDate(ctx, testCase = 'OLSD141R') {
+  const fromEnv = process.env.OLSD141R_PROCESSING_DATE || null;
+  if (fromEnv) {
+    log(`[${testCase}] Processing Date from environment: ${fromEnv}`);
+    return fromEnv;
   }
 
   const rows = await executeDbQuery(
-    `SELECT c.external_reference_no AS cif_nbr
-       FROM ${SCHEMA}.client c
-      WHERE c.external_reference_no IS NOT NULL
-        AND length(c.external_reference_no) = 19
-      ORDER BY c.external_reference_no DESC
-      LIMIT 1`,
-    [],
+    `SELECT to_char(MAX(source_create_date), 'YYYYMMDD') AS last_ymd
+       FROM ${SCHEMA}.batch_header WHERE file_id = $1`,
+    [CONFIG.seedMerge.fileId],
     testCase
-  ).catch((error) => {
-    log(`[${testCase}] ⚠️ Cannot discover a CIF from ${SCHEMA}.client: ${maskSecret(error.message)}`);
-    return [];
-  });
+  );
+  const lastYmd = (rows[0] && rows[0].last_ymd) || null;
 
-  if (!rows.length) {
-    throw new Error(
-      `[${testCase}] No 19-digit CIF found in ${SCHEMA}.client - set OLSD141R_CIF_A and rerun.`
-    );
+  const day = (ymd, offset) => {
+    const d = new Date(`${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + offset);
+    return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}` +
+      `${String(d.getUTCDate()).padStart(2, '0')}`;
+  };
+
+  let ymd = ctx.batchDateYmd;
+  if (lastYmd && lastYmd >= ymd) ymd = day(lastYmd, 1);
+
+  // Safety net: never send a date that is already in the ledger.
+  while (await executeDbQuery(
+    `SELECT 1 FROM ${SCHEMA}.batch_header WHERE file_id = $1 AND source_create_date::date = $2::date LIMIT 1`,
+    [CONFIG.seedMerge.fileId, `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`],
+    testCase
+  ).then((r) => r.length > 0)) {
+    ymd = day(ymd, 1);
   }
 
-  const cifA = String(rows[0].cif_nbr).trim();
-  const cifB = envB || syntheticUnusedCif(cifA);
-  log(`[${testCase}] Seed CIF pair from ${SCHEMA}.client: A=${cifA}, B=${cifB} (synthetic)`);
-  return { cifA, cifB };
+  if (ymd !== ctx.batchDateYmd) {
+    log(`[${testCase}] Last ${CONFIG.seedMerge.fileId} CreateDate in ${SCHEMA}.batch_header = ` +
+      `${lastYmd || '-'} - new file uses CreateDate ${ymd} (must be later and not repeat)`);
+  }
+  return `${ymd.slice(6, 8)}${ymd.slice(4, 6)}${ymd.slice(0, 4)}`;
+}
+
+// ============ CIF NUMBERS (STEP 1) ============
+/** Random 19-digit CIF (first digit not zero). */
+function randomCif() {
+  let out = String(1 + Math.floor(Math.random() * 9));
+  while (out.length < 19) out += String(Math.floor(Math.random() * 10));
+  return out;
+}
+
+/** Does the CIF already exist in CLIENT? (requirement: the generated CIFs must not exist) */
+export async function cifExistsInClient(cif, testCase = 'OLSD141R') {
+  const rows = await executeDbQuery(
+    `SELECT 1 FROM ${SCHEMA}.client WHERE ${CONFIG.database.cifColumn} = $1 LIMIT 1`,
+    [cif],
+    testCase
+  );
+  return rows.length > 0;
+}
+
+/** Generate `count` distinct CIF numbers that do not exist in CLIENT yet. */
+export async function generateUniqueCifs(count = CIF_COUNT, testCase = 'OLSD141R') {
+  const cifs = [];
+  while (cifs.length < count) {
+    let accepted = false;
+    for (let attempt = 0; attempt < 100 && !accepted; attempt += 1) {
+      const candidate = randomCif();
+      if (cifs.includes(candidate)) continue;
+      if (await cifExistsInClient(candidate, testCase)) {
+        log(`[${testCase}] CIF ${candidate} already exists in ${SCHEMA}.client - regenerating`);
+        continue;
+      }
+      cifs.push(candidate);
+      accepted = true;
+    }
+    if (!accepted) throw new Error(`[${testCase}] Cannot generate an unused CIF number.`);
+  }
+  log(`[${testCase}] Generated ${cifs.length} new CIF number(s) not present in ${SCHEMA}.client`);
+  return cifs;
+}
+
+/** Which of the given CIFs exist in CLIENT (used to verify OLSDB012). */
+export async function findCifsInClient(cifs, testCase = 'OLSD141R') {
+  const rows = await executeDbQuery(
+    `SELECT ${CONFIG.database.cifColumn} AS cif FROM ${SCHEMA}.client
+      WHERE ${CONFIG.database.cifColumn} = ANY($1)`,
+    [cifs],
+    testCase
+  );
+  return rows.map((r) => String(r.cif).trim());
 }
 
 // ============ EXPECTED DATA / JOB ID ============
@@ -363,11 +493,11 @@ export async function countMergeRows(jobId, testCase = 'OLSD141R') {
 }
 
 // ============ BATCH OUTPUT ============
-/** .out / .rej / .err files written by OLSDB057 for the uploaded file. */
-async function listSeedOutputs(fileName, testCase = 'OLSDB057') {
+/** .out / .rej / .err files written by a batch for the uploaded file. */
+async function listOutputs(remotePath, fileName, testCase) {
   try {
     const stdout = await executeRemoteCommand(
-      `ls -1 ${CONFIG.winscp.remotePath}${fileName.replace(/\.dat$/, '')}* 2>/dev/null || true`,
+      `ls -1 ${remotePath}${fileName.replace(/\.dat$/, '')}* 2>/dev/null || true`,
       testCase
     );
     const files = String(stdout).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
@@ -383,121 +513,157 @@ async function listSeedOutputs(fileName, testCase = 'OLSDB057') {
   }
 }
 
-async function waitForSeedOutputs(fileName, { add, timeoutMs = 180000, intervalMs = 5000 }) {
+async function waitForOutputs(remotePath, fileName, batchId, {
+  timeoutMs = 180000, intervalMs = 5000,
+} = {}) {
   const deadline = Date.now() + timeoutMs;
-  let outputs = await listSeedOutputs(fileName);
+  let outputs = await listOutputs(remotePath, fileName, batchId);
   while (!outputs.files.length && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    outputs = await listSeedOutputs(fileName);
+    outputs = await listOutputs(remotePath, fileName, batchId);
   }
-
-  add('5', 'Wait for OLSDB057 output files (.out/.rej/.err)', outputs.files.length > 0,
-    outputs.files.length
-      ? `${outputs.files.length} output file(s): ${outputs.files.join(', ')}`
-      : 'none found - the file may have been rejected before import');
   return outputs;
-}
-
-/** Poll dwh_temp_cif_merge until the run has rows (the batch may still be committing). */
-async function waitForMergeRows(jobId, { timeoutMs = 180000, intervalMs = 5000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  let rows = 0;
-  for (;;) {
-    rows = await countMergeRows(jobId);
-    if (rows > 0 || Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return rows;
 }
 
 // ============ PREPARE DATA ============
 /**
- * Full data-preparation flow: OLSMECIF -> upload -> OLSDB057 -> DWH_TEMP_CIF_MERGE -> job_id.
- * @returns {Promise<{ctx: Object, jobId: string|null, fileName: string, steps: Array}>}
+ * Full data preparation: OLSDB012 (7 CIFs) -> OLSDB057 (4 merge records) -> job_id.
+ * @returns {Promise<{ctx: Object, cifs: string[], merges: Array, jobId: string|null, steps: Array}>}
  */
 export async function prepareData(testCase = 'OLSD141R') {
   const steps = [];
-  const add = (no, name, ok, note = '', extra = {}) => {
-    steps.push({ no: String(no), name, ok: Boolean(ok), note, ...extra });
+  const add = (no, name, ok, note = '') => {
+    steps.push({ no: String(no), name, ok: Boolean(ok), note });
     log(`[STEP ${no}] ${ok ? '✅' : '❌'} ${name}${note ? ' — ' + note : ''}`);
   };
 
-  log(`[${testCase}] === Prepare data for OLSD141R (CIF Merge) ===`);
+  log(`[${testCase}] === Prepare data for OLSD141R ===`);
   const ctx = await getBatchContext(testCase);
-  log(`[${testCase}] batch date = ${ctx.batchDateYmd}, cut-off = ${ctx.cutOffTime} ` +
-    `(module ${ctx.cutOffModuleId}) - cut-off is NOT a filter`);
+  log(`[${testCase}] batch date = ${ctx.batchDateYmd}`);
 
-  // ---- Step 1: build the OLSMECIF seed file ----
-  const pair = await resolveMergeCifPair(testCase);
-  const processingDate = process.env.OLSD141R_PROCESSING_DATE || ctx.batchDateYmd;
-  const createIso = `${processingDate.slice(0, 4)}-${processingDate.slice(4, 6)}-${processingDate.slice(6, 8)}`;
-
-  // BE051: a name already in batch_resource is rejected -> take the next free sequence.
-  let seq = await getNextFileNumber(createIso, testCase);
-  for (;;) {
-    if (!(await isFileNameUsed(mergeFileName(processingDate, seq), testCase))) break;
-    seq += 1;
-  }
-  const fileName = mergeFileName(processingDate, seq);
-
-  const content = buildMergeFile({
-    processingDateYmd: processingDate,
-    details: [{ cifNumberA: pair.cifA, cifNumberB: pair.cifB, corpPersonalIndicator: 'P' }],
+  // ---- Step 1: OLSCUST input with 7 new CIF numbers ----
+  const cifs = await generateUniqueCifs(CIF_COUNT, testCase);
+  const custTemplate = loadTemplate(CONFIG.templates.olscust);
+  const custNameInfo = await nextFreeSequence(
+    CONFIG.seedCust.fileId, ctx.batchDateYmd, (seq) => custFileName(ctx.batchDateYmd, seq), testCase
+  );
+  const cust = buildCustFile({
+    template: custTemplate,
+    cifs,
+    createDate: ctx.batchDateYmd,
+    fileNumber: custNameInfo.seq,
   });
 
-  const seedCopy = path.join(CONFIG.seed.seedDir, fileName);
-  fs.ensureDirSync(CONFIG.seed.seedDir);
+  fs.ensureDirSync(CONFIG.seedCust.seedDir);
   fs.ensureDirSync(CONFIG.winscp.localPath);
-  fs.writeFileSync(seedCopy, content);
-  fs.writeFileSync(stagingPath(fileName), content);
+  fs.writeFileSync(path.join(CONFIG.seedCust.seedDir, custNameInfo.fileName), cust.content);
+  fs.writeFileSync(stagingPath(custNameInfo.fileName), cust.content);
 
-  const recordLength = recordLengthOf(MERGE_FILE_LAYOUT.detail);
-  add('1', `Build ${CONFIG.seed.fileId} input file (CIF Merge)`,
-    content.length === (recordLength + EOL.length) * 3,
-    `${fileName}: CIF A=${pair.cifA} -> CIF B=${pair.cifB}, ${recordLength} chars/record, ` +
-    `${content.length} bytes (header + 1 detail + trailer) - copy: ${seedCopy}`);
+  add('1', `Generate ${CIF_COUNT} new CIF numbers (checked against ${SCHEMA}.client)`, true,
+    `${cifs.join(', ')} (saved as cif1..cif${CIF_COUNT})`);
+  add('2', `Build ${CONFIG.seedCust.fileId} input (recordAction='${CUST_ACTION}')`, true,
+    `${custNameInfo.fileName}: ${cifs.length} detail record(s), ` +
+    `recordCount=${cust.recordCount}, createDate=${ctx.batchDateYmd}`);
 
-  // ---- Step 2: upload ----
-  await uploadFiles([fileName], 'OLSDB057');
-  add('2', 'Upload file via WinSCP to SFTP', true, `${fileName} -> ${CONFIG.winscp.remotePath}`);
+  // ---- Step 2: run OLSDB012 ----
+  await uploadFiles([custNameInfo.fileName], CONFIG.seedCust.remotePath, 'OLSDB012');
+  add('3', `Upload ${custNameInfo.fileName} to SFTP`, true,
+    `${custNameInfo.fileName} -> ${CONFIG.seedCust.remotePath}`);
 
-  // ---- Step 3/4: run the CIF Merge batch ----
-  add('3', 'Run OLSDB057 batch (CIF Merge Process)', true,
-    `cd ${CONFIG.seed.scriptPath} && ./${CONFIG.seed.batchId}`);
-  await runRemoteBatch(CONFIG.seed.batchId, 'OLSDB057');
-  add('4', 'Wait for OLSDB057 to complete', true, 'batch finished (exit code 0)');
+  await runRemoteBatch(CONFIG.seedCust.batchId, 'OLSDB012');
+  add('4', `Run ${CONFIG.seedCust.batchId} batch`, true,
+    `cd ${CONFIG.batch.scriptPath} && ./${CONFIG.seedCust.batchId}`);
 
-  // ---- Step 5/6: output files + merge rows ----
-  const outputs = await waitForSeedOutputs(fileName, { add });
+  const custOutputs = await waitForOutputs(
+    CONFIG.seedCust.remotePath, custNameInfo.fileName, 'OLSDB012'
+  );
+  add('5', `Wait for ${CONFIG.seedCust.batchId} output files`, custOutputs.files.length > 0,
+    custOutputs.files.length ? custOutputs.files.join(', ') : 'no .out/.rej/.err found');
+
+  const foundCifs = await findCifsInClient(cifs, testCase);
+  const missingCifs = cifs.filter((c) => !foundCifs.includes(c));
+  add('6', `Verify ${CIF_COUNT} CIFs exist in ${SCHEMA}.client`, missingCifs.length === 0,
+    missingCifs.length ? `missing: ${missingCifs.join(', ')}` : `all ${CIF_COUNT} CIFs created`);
+
+  if (missingCifs.length) {
+    throw new Error(`[${testCase}] ${CONFIG.seedCust.batchId} did not create CIF(s): ` +
+      `${missingCifs.join(', ')} - stopping before ${CONFIG.seedMerge.batchId}`);
+  }
+
+  // ---- Step 3: OLSMECIF input with the 4 merge records ----
+  const merges = MERGE_PAIRS.map((pair, i) => ({
+    cifA: cifs[pair.source - 1],
+    cifB: cifs[pair.target - 1],
+    status: mergeStatusOf(i),
+  }));
+  const mergeTemplate = loadTemplate(CONFIG.templates.olmecif);
+  const mergeInfo = await nextFreeSequence(
+    CONFIG.seedMerge.fileId, ctx.batchDateYmd, (seq) => mergeFileName(ctx.batchDateYmd, seq), testCase
+  );
+  const processingDate = await resolveProcessingDate(ctx, testCase);
+  const merge = buildMergeFile({
+    template: mergeTemplate,
+    merges,
+    processingDate,
+  });
+
+  fs.ensureDirSync(CONFIG.seedMerge.seedDir);
+  fs.writeFileSync(path.join(CONFIG.seedMerge.seedDir, mergeInfo.fileName), merge.content);
+  fs.writeFileSync(stagingPath(mergeInfo.fileName), merge.content);
+
+  add('7', `Build ${CONFIG.seedMerge.fileId} input (${merges.length} merge records)`, true,
+    `${mergeInfo.fileName} (Processing Date ${processingDate}): ` +
+    merges.map((m, i) => `cif${MERGE_PAIRS[i].source}->cif${MERGE_PAIRS[i].target}(${m.status})`).join(', '));
+
+  // ---- Step 4: run OLSDB057 ----
+  await uploadFiles([mergeInfo.fileName], CONFIG.seedMerge.remotePath, 'OLSDB057');
+  add('8', `Upload ${mergeInfo.fileName} to SFTP`, true,
+    `${mergeInfo.fileName} -> ${CONFIG.seedMerge.remotePath}`);
+
+  await runRemoteBatch(CONFIG.seedMerge.batchId, 'OLSDB057');
+  add('9', `Run ${CONFIG.seedMerge.batchId} batch`, true,
+    `cd ${CONFIG.batch.scriptPath} && ./${CONFIG.seedMerge.batchId}`);
+
+  const mergeOutputs = await waitForOutputs(
+    CONFIG.seedMerge.remotePath, mergeInfo.fileName, 'OLSDB057'
+  );
+  add('10', `Wait for ${CONFIG.seedMerge.batchId} output files`, mergeOutputs.files.length > 0,
+    mergeOutputs.files.length ? mergeOutputs.files.join(', ') : 'no .out/.rej/.err found');
 
   const jobId = await resolveJobId(null, testCase);
   if (!jobId) {
-    add('6', `Check ${SCHEMA}.dwh_temp_cif_merge rows of this run`, false,
+    add('11', `Check ${SCHEMA}.dwh_temp_cif_merge rows of this run`, false,
       'no job_id found after OLSDB057 (the file may have been rejected)');
-    return { ctx, jobId: null, fileName, steps };
+    return { ctx, cifs, merges, custFile: custNameInfo.fileName, mergeFile: mergeInfo.fileName,
+      jobId: null, steps };
   }
 
-  const rowCount = await waitForMergeRows(jobId);
-  const validRows = await executeDbQuery(
-    `SELECT valid, count(*) AS rows FROM ${SCHEMA}.dwh_temp_cif_merge
-      WHERE job_id = $1 GROUP BY valid ORDER BY valid NULLS LAST`,
-    [jobId],
-    testCase
-  ).catch(() => []); // 'valid' is logging only
+  const rowCount = await countMergeRows(jobId, testCase);
+  add('11', `Check ${SCHEMA}.dwh_temp_cif_merge rows of this run`, rowCount > 0,
+    `job_id=${jobId}, rows=${rowCount}`);
 
-  add('6', `Check ${SCHEMA}.dwh_temp_cif_merge rows of this run`, rowCount > 0,
-    `job_id=${jobId}, rows=${rowCount}` +
-    (validRows.length ? ` | valid: ${validRows.map((r) => `${r.valid}=${r.rows}`).join(', ')}` : ''),
-    { sql: `SELECT * FROM ${SCHEMA}.dwh_temp_cif_merge WHERE job_id = '${jobId}';` });
-
-  log(`[${testCase}] Seed done: file=${fileName}, job_id=${jobId}, merge rows=${rowCount}`);
-  return { ctx, jobId, fileName, rowCount, outputs, steps };
+  log(`[${testCase}] Seed done: ${CIF_COUNT} CIFs, ${merges.length} merge records, ` +
+    `job_id=${jobId}, merge rows=${rowCount}`);
+  return {
+    ctx,
+    cifs,
+    // Verified right after OLSDB012, before the merge inactivates the source CIFs.
+    cifsFound: foundCifs,
+    merges,
+    custFile: custNameInfo.fileName,
+    mergeFile: mergeInfo.fileName,
+    jobId,
+    rowCount,
+    steps,
+  };
 }
 
 // Direct run: node scripts/OLSD141R/file-generator.js
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__dirname, 'file-generator.js')) {
   prepareData()
-    .then((result) => log('Done', { steps: (result.steps || []).length, jobId: result.jobId }))
+    .then((result) => log('Done', {
+      cifs: (result.cifs || []).length, jobId: result.jobId, steps: (result.steps || []).length,
+    }))
     .catch((error) => {
       console.error(error);
       process.exitCode = 1;

@@ -29,9 +29,11 @@ import { promisify } from 'util';
 import pg from 'pg';
 import {
   CONFIG, SCHEMA, SECTION, COLUMN_LAYOUT, FIELD_LABELS, ROW_FIELDS, TXN_TYPE_REDEMPTION,
+  RUN_ID, RUN_DIR, RUN_STARTED_ISO,
 } from './test-data.js';
 import {
   reportFileName, reportFileGlob, reportLocalPathForName, parseReportFileName,
+  runSnapshotPath, runPhase2SnapshotName, runMetadataPath, runBatchResultsPath,
 } from './file-naming.js';
 import {
   prepareData, getBatchContext, fetchRejectedRedemptions, getCutoffTimes,
@@ -75,6 +77,23 @@ let compareSummary = null;
 // (the phase-2 report of TC06 has the same file name and would overwrite the local file).
 let rawReportText = '';
 let seedFileNames = [];                      // file(s) OLSTXN uploaded by THIS run (used to scope asserts)
+const runInfo = {                            // evidence/metadata for the current run
+  runId: RUN_ID,
+  runDir: RUN_DIR,
+  runStartedAt: RUN_STARTED_ISO,
+  reportStartedAt: null,
+  reportFinishedAt: null,
+  remoteReportPath: null,
+  remoteReportTimestamp: null,
+  remoteReportSize: null,
+  downloadTimestamp: null,
+  localSnapshotPath: null,
+  snapshotSize: null,
+  phase2SnapshotPath: null,
+  status: 'IN_PROGRESS',
+  failedStep: null,
+  error: null,
+};
 const seedInfo = { outputs: null, postDate: null, cutoffs: null, dtOutRows: 0, dtRejRows: 0 };
 const runContext = { batchDateYmd: null };   // information for the dashboard header section
 
@@ -1331,9 +1350,14 @@ test.describe('OLSD134R - Batch Redemption Exception Report', () => {
     } else {
       log('[OLSD134R] Start report batch');
       const before = (await listRemoteReports(ctx.batchDateYmd, 'REPORT')).map((r) => r.signature);
+      runInfo.reportStartedAt = new Date().toISOString();
       await executeBatch('REPORT');
       addStep('10', 'Run OLSD134R batch', true, `cd ${CONFIG.batch.scriptPath} && ${CONFIG.batch.command}`);
       const fresh = await waitForFreshReport(ctx.batchDateYmd, before, 'REPORT');
+      runInfo.reportFinishedAt = new Date().toISOString();
+      runInfo.remoteReportPath = `${CONFIG.report.remoteDir}/${fresh.name}`;
+      runInfo.remoteReportTimestamp = fresh.mtime;
+      runInfo.remoteReportSize = fresh.size;
       remoteReportName = fresh.name;
       addStep('11', 'Wait for OLSD134R report file', true,
         `${CONFIG.report.remoteDir}/${remoteReportName} regenerated (${fresh.size} bytes)`);
@@ -1344,8 +1368,21 @@ test.describe('OLSD134R - Batch Redemption Exception Report', () => {
     log('📋 Step 4: Download report and parse');
     reportPath = await downloadReport(remoteReportName, 'REPORT');
     addStep('12', 'Download report to local', true, reportPath);
-    parsed = parseReport(fs.readFileSync(reportPath, 'utf8'));
-    rawReportText = fs.readFileSync(reportPath, 'utf8');
+    // Snapshot IMMEDIATELY (before any slow validation) so the current run owns its evidence
+    // even if the shared file in reports/OLSD134R/ is overwritten by another run.
+    fs.ensureDirSync(RUN_DIR);
+    const snapshotPath = runSnapshotPath(path.basename(reportPath));
+    fs.copyFileSync(reportPath, snapshotPath);
+    if (!fs.existsSync(snapshotPath)) {
+      throw new Error(`[REPORT] Cannot create snapshot for run ${RUN_ID}: ${snapshotPath}`);
+    }
+    runInfo.downloadTimestamp = new Date().toISOString();
+    runInfo.localSnapshotPath = snapshotPath;
+    runInfo.snapshotSize = fs.statSync(snapshotPath).size;
+    log(`[OLSD134R] runId=${RUN_ID} | snapshot=${snapshotPath} (${runInfo.snapshotSize} bytes)`);
+    // Parse/validate the SNAPSHOT - never the shared file again.
+    rawReportText = fs.readFileSync(snapshotPath, 'utf8');
+    parsed = parseReport(rawReportText);
     const parseNote = `parse: records=${parsed.section.groups.reduce((n, g) => n + g.rows.length, 0)}, ` +
       `warnings=${parsed.warnings.length}, Report Date=${parsed.header.reportDate || parsed.header.batchDate || 'n/a'}`;
     addStep('13', 'Verify report: parse + compare DB vs report', parsed.warnings.length === 0,
@@ -1655,7 +1692,16 @@ test.describe('OLSD134R - Batch Redemption Exception Report', () => {
     await executeBatch('TC06');
     const fresh = await waitForFreshReport(ctx.batchDateYmd, before, 'TC06');
     const phase2Path = await downloadReport(fresh.name, 'TC06');
-    const phase2 = parseReport(fs.readFileSync(phase2Path, 'utf8'));
+    // Phase 2 gets its OWN snapshot (never overwrite phase-1 snapshot) - same runId.
+    fs.ensureDirSync(RUN_DIR);
+    const phase2Snapshot = runSnapshotPath(runPhase2SnapshotName(path.basename(phase2Path)));
+    fs.copyFileSync(phase2Path, phase2Snapshot);
+    if (!fs.existsSync(phase2Snapshot)) {
+      throw new Error(`[TC06] Cannot create phase-2 snapshot for run ${RUN_ID}: ${phase2Snapshot}`);
+    }
+    runInfo.phase2SnapshotPath = phase2Snapshot;
+    log(`[TC06] phase-2 snapshot=${phase2Snapshot} (${fs.statSync(phase2Snapshot).size} bytes, runId=${RUN_ID})`);
+    const phase2 = parseReport(fs.readFileSync(phase2Snapshot, 'utf8'));
     const phase2Keys = new Set(flattenReportRows(phase2).map(reportRecordKey));
 
     for (const row of includedRows) {
@@ -1723,6 +1769,37 @@ test.describe('OLSD134R - Batch Redemption Exception Report', () => {
       writeDashboard(reportPath, rawReportText);
     } catch (error) {
       log(`⚠️ Cannot write dashboard: ${error.message}`);
+    }
+    // ---- Per-run evidence: run-metadata.json + batch-results.json inside runs/<runId>/ ----
+    try {
+      const failed = testCaseResults.filter((t) => !t.ok);
+      runInfo.status = failed.length ? 'FAILED' : 'PASSED';
+      runInfo.batchDate = ctx ? ctx.batchDate : null;
+      runInfo.inputFilename = seedFileNames.join(', ') || null;
+      runInfo.olsdb009Result = seedRejected.length ? 'OK' : 'NO_REJECTED_ROW';
+      runInfo.olsdr134Result = reportPath ? 'OK' : 'UNKNOWN';
+      runInfo.lastCutOff = seedInfo.cutoffs ? seedInfo.cutoffs.last_cutoff_time : null;
+      runInfo.currentCutOff = seedInfo.cutoffs ? seedInfo.cutoffs.current_cutoff_time : null;
+      runInfo.expectedRecordCount = compareSummary ? compareSummary.expectedRecords : null;
+      runInfo.actualRecordCount = compareSummary ? compareSummary.actualRecords : null;
+      runInfo.matchedFieldCount = compareSummary
+        ? compareSummary.fieldsChecked - compareSummary.mismatchedFields : null;
+      runInfo.mismatchCount = compareSummary ? compareSummary.mismatchedFields : null;
+      runInfo.failedTests = failed.map((t) => `${t.id}: ${t.note}`);
+
+      fs.ensureDirSync(RUN_DIR);
+      fs.writeFileSync(runMetadataPath(), JSON.stringify(runInfo, null, 2));
+      fs.writeFileSync(runBatchResultsPath(), JSON.stringify({
+        runId: RUN_ID,
+        batchDate: runInfo.batchDate,
+        generatedAt: new Date().toISOString(),
+        results: testCaseResults.map((t) => ({
+          testCase: t.id, success: t.ok, label: t.label, note: t.note,
+        })),
+      }, null, 2));
+      log(`📄 Run metadata: ${runMetadataPath()} (status=${runInfo.status})`);
+    } catch (error) {
+      log(`⚠️ Cannot write run metadata: ${error.message}`);
     }
   });
 });

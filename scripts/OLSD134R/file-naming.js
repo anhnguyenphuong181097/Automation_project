@@ -12,7 +12,27 @@
 // in scripts/OLSDB009/file-generator.js and are reused without renaming.
 
 import path from 'path';
-import { CONFIG } from './test-data.js';
+import { CONFIG, RUN_DIR } from './test-data.js';
+
+/** reports\OLSD134R\runs\<runId>\<ten file report> - snapshot rieng cho current run */
+export function runSnapshotPath(fileName) {
+  return path.join(RUN_DIR, fileName);
+}
+
+/** Ten snapshot cho phase 2 (TC06) - khong duoc trung/de len snapshot phase 1 */
+export function runPhase2SnapshotName(fileName) {
+  return String(fileName).replace(/\.txt$/i, '_phase2.txt');
+}
+
+/** reports\OLSD134R\runs\<runId>\run-metadata.json */
+export function runMetadataPath() {
+  return path.join(RUN_DIR, 'run-metadata.json');
+}
+
+/** reports\OLSD134R\runs\<runId>\batch-results.json */
+export function runBatchResultsPath() {
+  return path.join(RUN_DIR, 'batch-results.json');
+}
 
 /** MYOLSD134R20260922.txt */
 export function reportFileName(batchDateYmd) {

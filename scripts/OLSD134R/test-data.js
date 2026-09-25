@@ -114,6 +114,23 @@ export const SCHEMA = CONFIG.database.schema;
 // File ID in batch_header/dwh_temp_txn for the OLSTXN process (OLSD134R reads data from here)
 export const FILE_ID = 'OLSTXN';
 
+// ---------------------------------------------------------------------------
+// Per-run identity: created ONCE for the whole execution (module load), so phase 1 and
+// phase 2/TC06 always share the same runId. No new helper/source file - kept here because
+// this module is imported by both the generator and the spec.
+// ---------------------------------------------------------------------------
+const RUN_STARTED_AT = new Date();
+const pad2 = (n) => String(n).padStart(2, '0');
+
+export const RUN_ID = process.env.OLSD134R_RUN_ID
+  || `${RUN_STARTED_AT.getFullYear()}${pad2(RUN_STARTED_AT.getMonth() + 1)}${pad2(RUN_STARTED_AT.getDate())}`
+  + `_${pad2(RUN_STARTED_AT.getHours())}${pad2(RUN_STARTED_AT.getMinutes())}${pad2(RUN_STARTED_AT.getSeconds())}`;
+
+export const RUN_STARTED_ISO = RUN_STARTED_AT.toISOString();
+
+/** reports\OLSD134R\runs\<runId>\ - runtime artifact folder for this execution */
+export const RUN_DIR = path.join(PROJECT_ROOT, 'reports', 'OLSD134R', 'runs', RUN_ID);
+
 // Receiving system written in HD cell 2 of the pushed OLSTXN file.
 // Evidence from the batch (.err): "Invalid Data Receiving System, Accepted Values (OLS)"
 // -> OLSTXN files must always declare receiving system 'OLS'.
