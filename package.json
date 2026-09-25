@@ -1,0 +1,67 @@
+{
+  "name": "batch-ocbc-pw1",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:tc1": "npx playwright test --grep 'TC1'",
+    "test:tc2": "npx playwright test --grep 'TC2'",
+    "test:tc3": "npx playwright test --grep 'TC3'",
+    "test:tc4": "npx playwright test --grep 'TC4'",
+    "test:tc5": "npx playwright test --grep 'TC5'",
+    "test:tc6": "npx playwright test --grep 'TC6'",
+    "test:tc7": "npx playwright test --grep 'TC7'",
+    "test:tc8": "npx playwright test --grep 'TC8'",
+    "test:tc9": "npx playwright test --grep 'TC9'",
+    "test:tc10": "npx playwright test --grep 'TC10'",
+    "test:all": "npx playwright test --workers=1 --reporter=html,json,junit",
+    "test:batch": "npm run test:all && npm run generate:dashboard",
+    "test:smoke": "npx playwright test --grep '@smoke' --reporter=html,json",
+    "test:critical": "npx playwright test --grep '@critical' --reporter=html,json",
+    "test:high": "npx playwright test --grep '@high' --reporter=html,json",
+    "test:medium": "npx playwright test --grep '@medium' --reporter=html,json",
+    
+    "generate": "node scripts/file-generator.js",
+    "generate:olsdb024": "node scripts/OLSDB024/file-generator.js",
+
+    "generate:olsdb020": "node scripts/OLSDB020/file-generator.js",
+
+    "generate:olsdb009": "node scripts/OLSDB009/file-generator.js",
+    "test:olsdb009": "npx playwright test scripts/OLSDB009/test-runner.spec.js",
+    "pool:olsdb009": "node scripts/OLSDB009/data-pool.js",
+    "refresh:pool:olsdb009": "node scripts/OLSDB009/data-pool.js --refresh",
+
+    "generate:all": "npm run generate:olsdb014 && npm run generate:olsdb006 && npm run generate:olsdb024",
+    "test:olsdb024": "npx playwright test scripts/OLSDB024/test-runner.spec.js",
+    "generate:olsd141r": "node scripts/OLSD141R/file-generator.js",
+    "test:olsd141r": "npx playwright test scripts/OLSD141R/test-runner.spec.js",
+    "generate:dashboard": "node scripts/generate-dashboard.js",
+    "generate:report": "node scripts/generate-batch-report.js",
+    "report": "npx playwright show-report",
+    "report:json": "npx playwright test --reporter=json > test-results.json",
+    "dashboard:serve": "node dashboard-server.js",
+    "dashboard:open": "npm run generate:dashboard && npm run dashboard:serve",
+    "clean": "if exist test-data\\generated rmdir /s /q test-data\\generated & mkdir test-data\\generated & if exist logs rmdir /s /q logs & mkdir logs & if exist reports rmdir /s /q reports & mkdir reports & if exist playwright-report rmdir /s /q playwright-report & if exist test-results.json del test-results.json & if exist allure-results rmdir /s /q allure-results & if exist allure-report rmdir /s /q allure-report",
+    "clean:all": "rmdir /s /q node_modules 2>nul & del package-lock.json 2>nul & echo Cleaned all!"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0",
+    "@types/node": "^20.10.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "fs-extra": "^11.1.1",
+    "moment": "^2.29.4",
+    "pg": "^8.22.0",
+    "winston": "^3.11.0",
+    "express": "^4.18.2",
+    "chart.js": "^4.4.0"
+  },
+  "DeepSeekCopilotAPIKey":  {
+  "deepseekCopilot.apiKey": "sk-your-actual-key-here",
+  "deepseekCopilot.maxTokens": 150,
+  "deepseekCopilot.enableInline": true,
+  "deepseekCopilot.suggestionDelay": 300
+ }
+
+}

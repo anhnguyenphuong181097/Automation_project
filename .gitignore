@@ -1,0 +1,34 @@
+# ---- dependencies ----
+node_modules/
+
+# ---- test artifacts (generated on every run) ----
+playwright-report/
+test-results/
+reports/
+logs/
+batch-results.json
+.execution-tracker.json
+allure-results/
+allure-report/
+
+# ---- generated test data / staging ----
+scripts/test-data/generated/
+test-data/generated/
+src/
+*.dat
+
+# ---- credentials & machine-local config ----
+.env
+.claude/settings.local.json
+.vscode/settings.json
+
+# ---- real dev data snapshot (contains real account/card numbers) ----
+scripts/test-data/pool/
+
+# ---- locally generated dashboards ----
+dashboard*.html
+
+# ---- OS ----
+Thumbs.db
+Desktop.ini
+.DS_Store
