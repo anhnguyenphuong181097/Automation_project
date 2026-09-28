@@ -131,30 +131,48 @@ export const TITLE_RE = /CIF\s+MERGE\s+FILE\s+REPORT/i;
 export const INDICATOR_DESC = { Y: 'Successful', N: 'Not Successful', Z: 'Not Found' };
 
 // ============ CIF MERGE RECORDS (STEP 2) ============
-// 7 CIFs are created by OLSDB012 and referenced by index (1..7 = cif1..cif7).
-export const CIF_COUNT = 7;
+// 15 CIFs are created by OLSDB012 and referenced by index (1..15 = cif1..cif15).
+export const CIF_COUNT = 15;
 
-// Merge records required by the BA: CIF1->CIF2, CIF2->CIF3, CIF4->CIF5, CIF6->CIF7.
+// Merge records (8) written into ONE OLSMECIF file per run (file = A + 8 D + T = 10 records):
+//   CIF1->CIF2 (Y), CIF3->CIF4 (N), CIF5->CIF6 (Z), CIF7->CIF8 (Y),
+//   CIF9->CIF10 (Y), CIF11->CIF12 (Y), CIF13->CIF14 (Y), CIF14->CIF15 (N)
 // Source/old CIF -> CIF# A, target/new CIF -> CIF# B.
+// The last record reuses CIF14 as source right after CIF14 became the target of CIF13->CIF14, so
+// the batch answers EB930 "Source cif is processing" - it is the rejected row of the report.
+// NOTE: OLS ignores the indicator/description on input (interface spec 2.12) - what the report
+// prints is the merge result returned by the batch and is validated against DWH_TEMP_CIF_MERGE.
 export const MERGE_PAIRS = [
-  { source: 1, target: 2 },
-  { source: 2, target: 3 },
-  { source: 4, target: 5 },
-  { source: 6, target: 7 },
+  { source: 1, target: 2, status: 'Y' },
+  { source: 3, target: 4, status: 'N' },
+  { source: 5, target: 6, status: 'Z' },
+  { source: 7, target: 8, status: 'Y' },
+  { source: 9, target: 10, status: 'Y' },
+  { source: 11, target: 12, status: 'Y' },
+  { source: 13, target: 14, status: 'Y' },
+  { source: 14, target: 15, status: 'N' },
 ];
 
-// Successful Indicator written into the OLSMECIF records.
-// The BA did not define which merge record gets Y/N/Z, so the value is configurable:
+/**
+ * Customer names written for every CIF of the OLSMECIF records, e.g. CIF1 ->
+ * 'CIF01 NAME 1' / 'CIF01 NAME 2'. Every CIF carries its own name so the report can be checked
+ * per CIF.
+ */
+export function cifName(index, part) {
+  return `CIF${String(index).padStart(2, '0')} NAME ${part}`;
+}
+
+// Successful Indicator written into the OLSMECIF records (default per merge record above).
+// Still configurable, e.g. to override all four:
 //   OLSD141R_MERGE_STATUSES="Y,N,Y,Z" (one letter per merge record)
-// Default: every record is sent as 'Y'.
 export const MERGE_STATUSES = (process.env.OLSD141R_MERGE_STATUSES || '')
   .split(',')
   .map((s) => s.trim().toUpperCase())
   .filter((s) => s in INDICATOR_DESC);
 
-/** Status of merge record i (0-based); falls back to 'Y'. */
+/** Status of merge record i (0-based): env override, else the per-record default, else 'Y'. */
 export function mergeStatusOf(index) {
-  return MERGE_STATUSES[index] || 'Y';
+  return MERGE_STATUSES[index] || (MERGE_PAIRS[index] && MERGE_PAIRS[index].status) || 'Y';
 }
 
 // recordAction of the OLSCUST detail records: 'A' (Add) - confirmed with the BA, the flow creates

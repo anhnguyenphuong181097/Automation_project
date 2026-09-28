@@ -19,7 +19,7 @@ import { fileURLToPath } from 'url';
 import pg from 'pg';
 import {
   CONFIG, SCHEMA, CIF_COUNT, MERGE_PAIRS, INDICATOR_DESC, mergeStatusOf,
-  CUST_ACTION, CUST_FIELDS, MERGE_FILE_LAYOUT, EXPECTED_QUERY,
+  CUST_ACTION, CUST_FIELDS, MERGE_FILE_LAYOUT, EXPECTED_QUERY, cifName,
 } from './test-data.js';
 import { custFileName, mergeFileName, stagingPath } from './file-naming.js';
 
@@ -151,6 +151,101 @@ function toIsoDate(value) {
   return ymd.length === 8 ? `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}` : s;
 }
 
+function isIsoDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value))) return false;
+  const d = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
+}
+
+function addDays(isoDate, offset) {
+  const d = new Date(`${isoDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + offset);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * STEP 0 - prepare ols_schema.batch_date before running OLSDB012.
+ *
+ * Same pattern as OLSD134R (scripts/OLSD134R/file-generator.js updateBatchDate):
+ *   batch_date = CURRENT_DATE, processing_date = CURRENT_DATE - 1,
+ *   last_update_date = now(), last_update_by = <testCase>,
+ *   WHERE record_no = (SELECT MAX(record_no) FROM batch_date).
+ * No auto restore: batch_date is a shared control table (same as OLSD134R).
+ *
+ * Overrides:
+ *   OLSD141R_BATCH_DATE=YYYY-MM-DD  -> batch_date = that date, processing_date = date - 1
+ *                                      (validated before any DB write; invalid -> fail)
+ *   OLSD141R_SKIP_BATCHDATE_UPDATE=1 -> skip the update (ignored when OLSD141R_BATCH_DATE is set)
+ *
+ * Unlike OLSD134R, the row is re-read after the UPDATE and verified; a mismatch throws before
+ * OLSDB012 runs.
+ */
+export async function updateBatchDate(testCase = 'OLSD141R') {
+  const override = (process.env.OLSD141R_BATCH_DATE || '').trim();
+  if (override && !isIsoDate(override)) {
+    throw new Error(
+      `[${testCase}] OLSD141R_BATCH_DATE must be a valid YYYY-MM-DD date, got "${override}" ` +
+      '(no DB write performed)'
+    );
+  }
+  if (!override && process.env.OLSD141R_SKIP_BATCHDATE_UPDATE === '1') {
+    log(`[${testCase}] Skip batch_date update (OLSD141R_SKIP_BATCHDATE_UPDATE=1)`);
+    return null;
+  }
+
+  const sel = `SELECT record_no,
+                      to_char(batch_date, 'YYYY-MM-DD')      AS batch_date,
+                      to_char(processing_date, 'YYYY-MM-DD') AS processing_date
+                 FROM ${SCHEMA}.batch_date ORDER BY record_no DESC LIMIT 1`;
+  const before = await executeDbQuery(sel, [], testCase);
+  if (!before.length) throw new Error(`[${testCase}] Table ${SCHEMA}.batch_date has no row.`);
+  log(`[${testCase}] Batch date before update: record_no = ${before[0].record_no}, ` +
+    `batch_date = ${before[0].batch_date}, processing_date = ${before[0].processing_date}`);
+
+  const sql = override
+    ? `UPDATE ${SCHEMA}.batch_date
+          SET batch_date      = $2::date,
+              processing_date = $2::date - 1,
+              last_update_date = now(),
+              last_update_by   = $1
+        WHERE record_no = (SELECT MAX(record_no) FROM ${SCHEMA}.batch_date)`
+    : `UPDATE ${SCHEMA}.batch_date
+          SET batch_date      = CURRENT_DATE,
+              processing_date = CURRENT_DATE - 1,
+              last_update_date = now(),
+              last_update_by   = $1
+        WHERE record_no = (SELECT MAX(record_no) FROM ${SCHEMA}.batch_date)`;
+  await executeDbQuery(sql, override ? [testCase, override] : [testCase], testCase);
+
+  // Verify by re-reading the row (expected batch date = override, else the DB CURRENT_DATE).
+  const check = await executeDbQuery(
+    `SELECT record_no,
+            to_char(batch_date, 'YYYY-MM-DD')      AS batch_date,
+            to_char(processing_date, 'YYYY-MM-DD') AS processing_date,
+            to_char(${override ? '$1::date' : 'CURRENT_DATE'}, 'YYYY-MM-DD') AS expected_batch_date
+       FROM ${SCHEMA}.batch_date ORDER BY record_no DESC LIMIT 1`,
+    override ? [override] : [],
+    testCase
+  );
+  const after = check[0];
+  const expectedProcessing = addDays(after.expected_batch_date, -1);
+  const verified = after.batch_date === after.expected_batch_date
+    && after.processing_date === expectedProcessing;
+
+  log(`[${testCase}] Batch date after update: record_no = ${after.record_no}, ` +
+    `batch_date = ${after.batch_date}, processing_date = ${after.processing_date}, ` +
+    `verified = ${verified ? 'YES' : 'NO'}`);
+  if (!verified) {
+    throw new Error(
+      `[${testCase}] batch_date update not verified: expected batch_date ` +
+      `${after.expected_batch_date} / processing_date ${expectedProcessing}, got ` +
+      `${after.batch_date} / ${after.processing_date}`
+    );
+  }
+
+  return { before: before[0], after, sql };
+}
+
 /**
  * Batch date of the current run (ols_schema.batch_date.batch_date).
  * OLSD141R needs no cut-off time: the data of this run is identified by the job_id of the
@@ -273,6 +368,10 @@ export function buildMergeFile({ template, merges, processingDate }) {
   const details = merges.map((m) => patchFixedWidth(detail, MERGE_FILE_LAYOUT.detail, {
     cifNumberA: m.cifA,
     cifNumberB: m.cifB,
+    aName1: m.aName1,
+    aName2: m.aName2,
+    bName1: m.bName1,
+    bName2: m.bName2,
     successfulIndicator: m.status,
     unsuccessfulErrorDesc: INDICATOR_DESC[m.status] || INDICATOR_DESC.Y,
   }));
@@ -538,6 +637,22 @@ export async function prepareData(testCase = 'OLSD141R') {
   };
 
   log(`[${testCase}] === Prepare data for OLSD141R ===`);
+
+  // STEP 0 - prepare ols_schema.batch_date before OLSDB012 (same pattern as OLSD134R).
+  const batchDateUpdate = await updateBatchDate(testCase);
+  if (batchDateUpdate) {
+    add('0', 'Update batch_date (STEP 0, before OLSDB012)', true,
+      `record_no=${batchDateUpdate.after.record_no} | before: ` +
+      `batch_date=${batchDateUpdate.before.batch_date}, ` +
+      `processing_date=${batchDateUpdate.before.processing_date} -> after: ` +
+      `batch_date=${batchDateUpdate.after.batch_date}, ` +
+      `processing_date=${batchDateUpdate.after.processing_date} | verified=YES`,
+      { sql: batchDateUpdate.sql });
+  } else {
+    add('0', 'Update batch_date (STEP 0, before OLSDB012)', false,
+      'skipped (OLSD141R_SKIP_BATCHDATE_UPDATE=1)');
+  }
+
   const ctx = await getBatchContext(testCase);
   log(`[${testCase}] batch date = ${ctx.batchDateYmd}`);
 
@@ -595,6 +710,11 @@ export async function prepareData(testCase = 'OLSD141R') {
     cifA: cifs[pair.source - 1],
     cifB: cifs[pair.target - 1],
     status: mergeStatusOf(i),
+    // Every CIF carries its own name so the report can be verified per CIF.
+    aName1: cifName(pair.source, 1),
+    aName2: cifName(pair.source, 2),
+    bName1: cifName(pair.target, 1),
+    bName2: cifName(pair.target, 2),
   }));
   const mergeTemplate = loadTemplate(CONFIG.templates.olmecif);
   const mergeInfo = await nextFreeSequence(

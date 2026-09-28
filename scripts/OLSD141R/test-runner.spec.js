@@ -44,6 +44,7 @@ const execAsync = promisify(exec);
 
 // ============ DASHBOARD DATA ============
 const STEP_LEGEND = [
+  ['0', 'Update batch_date = CURRENT_DATE (STEP 0, before OLSDB012)'],
   ['1', `Generate ${CIF_COUNT} new CIF numbers (checked against CLIENT)`],
   ['2', 'Build OLSCUST input (recordAction + one detail per CIF)'],
   ['3', 'Upload OLSCUST to SFTP'],
@@ -64,9 +65,12 @@ const STEP_LEGEND = [
 
 const steps = [];
 const testCaseResults = [];
-const runContext = { batchDateYmd: null, jobId: null, cifs: [], merges: [], report: null };
+const runContext = {
+  batchDateYmd: null, jobId: null, cifs: [], cifsFound: [], merges: [], report: null,
+};
 let comparison = null;
 let headerCheck = null;
+let rawReportText = '';   // raw content of the report of this run (dashboard "Report Layout")
 
 function addStep(no, name, ok, note = '') {
   steps.push({ no: String(no), name, ok: Boolean(ok), note });
@@ -552,17 +556,6 @@ function compareRows(actualRows, expectedRows) {
   };
 }
 
-/** Y = accepted, N/Z = rejected. */
-function countByIndicator(rows) {
-  const counts = { Y: 0, N: 0, Z: 0, other: [] };
-  for (const row of rows) {
-    const ind = normalizeText(row.indicator).toUpperCase();
-    if (ind === 'Y' || ind === 'N' || ind === 'Z') counts[ind] += 1;
-    else counts.other.push(row);
-  }
-  return counts;
-}
-
 // ============ DASHBOARD ============
 function escapeHtml(value) {
   return String(value === null || value === undefined ? '' : value)
@@ -629,6 +622,16 @@ function writeDashboard(reportPath, remoteReportName) {
       <h3>Mismatched fields</h3>
       ${rowsTable(comparison.mismatches)}` : '';
 
+    // Raw report of this run - same "Report Layout" block as the OLSD134R dashboard.
+    const reportLayoutHtml = rawReportText ? `
+      <h2>Report Layout</h2>
+      <p>Raw report file exactly as generated (fixed-width, ${rawReportText.split(/\r?\n/).length - 1} lines):
+         ${escapeHtml(runContext.report ? runContext.report.name : 'n/a')} ·
+         size ${escapeHtml(runContext.report ? runContext.report.size : 'n/a')} bytes ·
+         mtime ${escapeHtml(runContext.report ? runContext.report.mtime : 'n/a')} ·
+         md5 ${escapeHtml(runContext.report ? runContext.report.md5 : 'n/a')}</p>
+      <pre class="report-raw">${escapeHtml(rawReportText)}</pre>` : '';
+
     const html = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <title>OLSD141R - CIF Merge File Report</title>
@@ -640,6 +643,9 @@ function writeDashboard(reportPath, remoteReportName) {
   th { background:#1a2430; }
   .ok { color:#4ade80; font-weight:bold; } .fail { color:#f87171; font-weight:bold; }
   .muted { color:#8b9aa8; }
+  pre.report-raw { background:#0b1015; border:1px solid #2c3a47; border-radius:8px; padding:12px;
+    margin:8px 0 20px; font-family:Consolas, Menlo, monospace; font-size:12px; line-height:1.35;
+    overflow-x:auto; white-space:pre; color:#cfe0ee; }
 </style></head><body>
 <h1>OLSD141R - CIF Merge File Report</h1>
 <p>Batch date: ${escapeHtml(runContext.batchDateYmd || 'n/a')} |
@@ -665,6 +671,7 @@ function writeDashboard(reportPath, remoteReportName) {
 
 ${headerCompare}
 ${compareHtml}
+${reportLayoutHtml}
 
 <h2>Step legend</h2>
 <table><thead><tr><th>#</th><th>Step</th></tr></thead><tbody>${legendRows}</tbody></table>
@@ -707,6 +714,7 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
         runContext.batchDateYmd = ctx.batchDateYmd;
       }
       runContext.cifs = seed.cifs || [];
+      runContext.cifsFound = seed.cifsFound || [];
       runContext.merges = seed.merges || [];
       runContext.jobId = seed.jobId || null;
     }
@@ -740,7 +748,8 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
       `${remoteReport} | ${runContext.report.size} bytes | mtime ${runContext.report.mtime} | ` +
       `md5 ${runContext.report.md5} | ${reportPath}`);
 
-    parsed = parseReport(fs.readFileSync(reportPath, 'utf8'));
+    rawReportText = fs.readFileSync(reportPath, 'utf8');
+    parsed = parseReport(rawReportText);
     addStep('23', 'Parse report (header / detail / summary / footer)', parsed.warnings.length === 0,
       `FILE DATE=${parsed.header.fileDate || 'n/a'}, PROC DATE=${parsed.header.procDate || 'n/a'}, ` +
       `File Name=${parsed.header.fileName || 'n/a'}, rows=${parsed.rows.length}, ` +
@@ -1058,12 +1067,15 @@ test.describe('OLSD141R - CIF Merge File Report', () => {
     }
 
     if (expectedRows) {
-      const dbCounts = countByIndicator(expectedRows);
-      if (dbCounts.Y !== expectedAccepted) {
-        issues.push(`DB has ${dbCounts.Y} Indicator=Y row(s), report has ${expectedAccepted}`);
+      // The DB is counted the same way as the report: by the merge result (error / valid=0), not by
+      // the Successful Indicator - job 34716 = 3 rows without error + 1 row EB930 (valid=0).
+      const dbWithError = expectedRows.filter(hasError).length;
+      const dbWithoutError = expectedRows.length - dbWithError;
+      if (dbWithoutError !== expectedAccepted) {
+        issues.push(`DB has ${dbWithoutError} row(s) without error, report has ${expectedAccepted} accepted`);
       }
-      if (dbCounts.N + dbCounts.Z !== expectedRejected) {
-        issues.push(`DB has ${dbCounts.N + dbCounts.Z} Indicator=N/Z row(s), report has ${expectedRejected}`);
+      if (dbWithError !== expectedRejected) {
+        issues.push(`DB has ${dbWithError} row(s) with error, report has ${expectedRejected} rejected`);
       }
     }
 
