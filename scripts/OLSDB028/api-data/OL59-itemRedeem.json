@@ -1,0 +1,129 @@
+{
+  "_comment": [
+    "Input data of OLSDB028. Every entry of \"cases\" produces ONE Item Redemption API call (OL59)",
+    "and therefore one redemption reference in ITEM_FULFILMENT_STATUS (one OLSITRED Detail group).",
+    "Nothing here is hard-coded in the code: edit this file to add / change redemptions.",
+    "",
+    "Placeholders resolved at run time (any string value, at any depth):",
+    "  {{timestamp}}   -> SvcRq/OLSRq timestamp, format yyyyMMdd HHmmss (execution time)",
+    "  {{messageNum}}  -> unique 6-character message number of this request",
+    "  {{msgSqNum}}    -> message sequence number of this request",
+    "  {{todayYmd}} / {{nowIso}} / {{runId}}",
+    "",
+    "A case may also compute the price fields instead of spelling them out:",
+    "  \"unitPriceInPoints\" + \"quantity\"  -> itmRdmFullPriceInPoints, itmRdmPoolUnitsRequired,",
+    "                                    itmRdmQuantityItem, itmRdmReceiveQuantity",
+    "An explicit value in the case always wins over the computed one.",
+    "",
+    "Baseline taken from the BA request template (F:\\OCBC\\OCBC.postman_collection.json, OL59_ItemRedeemp).",
+    "Verified on dev 29/09/2026: ReturnCode '00000' => ITEM_FULFILMENT_STATUS row +",
+    "cat_catalogue_trans_details row (status 'A') are created by the API itself.",
+    "",
+    "SvcRq.ChannelId is NOT written here: it is resolved from item_price.redemption_channel of the",
+    "item (active row, selected by itmRdmRewardCurrency / poolId / priceId) and injected through the",
+    "{{channelId}} placeholder. Same for the unit price: itmRdmFullPriceInPoints is computed as",
+    "item_price.price_in_point * quantity unless the case sets it explicitly.",
+    "Reason: each item can be priced per channel - UG7814 has ENQ1/0VN/12 for MB and HT4/3CC/119,",
+    "and sending a channel the item is not priced for is rejected with E5921 (Item Price not found).",
+    "Other observed business failures: E5903 (Pool Units + Cash Required do not match Item Price),",
+    "E5908 (Item Quantity is below minimum required - use quantity >= 100 for this item)."
+  ],
+  "disabled": false,
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "template": {
+    "SvcRq": {
+      "ChannelId": "{{channelId}}",
+      "Timestamp": "{{timestamp}}",
+      "TimeoutPeriod": 99,
+      "MessageNum": "{{messageNum}}"
+    },
+    "OLSRq": {
+      "MsgSqNum": "{{msgSqNum}}",
+      "Timestamp": "{{timestamp}}",
+      "Region": "MY",
+      "MsgCode": "OL59",
+      "ProcessingCode": "000000"
+    },
+    "itemRedeem": {
+      "itmRdmCIFNum": "002222300006877",
+      "itmRdmAcctNum": "",
+      "itmRdmCardNum": "",
+      "itmRdmCatalogue": "UGCTLG",
+      "itmRdmRewardCurrency": "0VN",
+      "itmRdmItemCode": "UG7814",
+      "itmRdmFullPriceInPoints": 1200,
+      "itmRdmPoolUnitsRequired": 1200,
+      "itmRdmCashRequired": "0",
+      "itmEnqAdminFeeGrp": [],
+      "itmRdmQuantityItem": "100",
+      "itmRdmReceiveQuantity": "100",
+      "itmRdmReceivingAcctOrId": "3320028886",
+      "itmRdmReceivingFirstName": "trang",
+      "itmRdmReceivingLastName": "nguyen",
+      "itmRdmDeliveryAddress1": "123 Main Street",
+      "itmRdmDeliveryAddress2": "Suite 4B",
+      "itmRdmCity": "Hanoi",
+      "itmRdmZIPCode": "100000",
+      "itmRdmRecipientName": "John Doe",
+      "itmRdmTitle": "Mr",
+      "itmRdmMobile": "0912345678",
+      "itmRdmRemarks": "OLSDB028 automation {{runId}}"
+    }
+  },
+  "cases": [
+    {
+      "id": "OL59-A",
+      "description": "UG7814 x100 (channel + unit price resolved from item_price) -> one issued row",
+      "quantity": 100,
+      "itemRedeem": {}
+    },
+    {
+      "id": "OL59-B",
+      "description": "same item, different quantity -> a second reference / Detail record",
+      "quantity": 200,
+      "itemRedeem": {
+        "itmRdmRemarks": "OLSDB028 automation {{runId}} case B"
+      }
+    },
+    {
+      "_comment": "MA (point transfer) - request da chay THANH CONG tren dev 30/09/2026 (ref 58187457). Dac thu cua MA: itmRdmFullPriceInPoints / PoolUnitsRequired = price_in_point * 100 (10.00 -> 1000), itmRdmQuantityItem = 100, itmRdmReceiveQuantity = 1000 (KHAC quantity). Channel INB + Region ID.",
+      "id": "MA-ITER",
+      "description": "MA point transfer - ITER, full 1000 / pool units 1000, quantity 100, receive 1000",
+      "quantity": 100,
+      "itemRedeem": {
+        "itmRdmCatalogue": "TRANG",
+        "itmRdmRewardCurrency": "0VN",
+        "itmRdmItemCode": "ITER",
+        "itmRdmFullPriceInPoints": 1000,
+        "itmRdmPoolUnitsRequired": 1000,
+        "itmRdmQuantityItem": "100",
+        "itmRdmReceiveQuantity": "1000",
+        "itmRdmReceivingAcctOrId": "335221784",
+        "itmRdmReceivingFirstName": "Enrich",
+        "itmRdmReceivingLastName": "Blue Partner",
+        "itmRdmRemarks": "OLSDB028 automation {{runId}} - MA"
+      }
+    },
+    {
+      "_comment": "PI (A Donation) - request chay THANH CONG tren dev 01/10/2026 (ref 58211449, 58212449). item_price ENQ1/0VN/2.00, full = price * quantity = 200 voi quantity 100, receiveQuantity = 100.",
+      "id": "PI-APZ3K",
+      "description": "PI donation - APZ3K, full 200 / pool units 200, quantity 100",
+      "quantity": 100,
+      "itemRedeem": {
+        "itmRdmCatalogue": "ACATA",
+        "itmRdmRewardCurrency": "0VN",
+        "itmRdmItemCode": "APZ3K",
+        "itmRdmFullPriceInPoints": 200,
+        "itmRdmPoolUnitsRequired": 200,
+        "itmRdmQuantityItem": "100",
+        "itmRdmReceiveQuantity": "100",
+        "itmRdmReceivingAcctOrId": "335221784",
+        "itmRdmReceivingFirstName": "Enrich",
+        "itmRdmReceivingLastName": "Blue Partner",
+        "itmRdmRemarks": "OLSDB028 automation {{runId}} - PI"
+      }
+    }
+  ]
+}

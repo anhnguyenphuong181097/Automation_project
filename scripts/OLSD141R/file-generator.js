@@ -70,6 +70,36 @@ export async function runRemoteBatch(batchId, testCase = batchId) {
   }
 }
 
+/**
+ * Keep only the newest generated input file of a batch in a folder: every run produces a new file
+ * name (BE051/BE302 require an unused name), so the older copies pile up in
+ * scripts\test-data\generated\OLSD141R\* and in the local staging folder (LOCAL_PATH).
+ * Only files matching `<prefix>*.dat` are touched; other batches' files (OLSTERM, OLSTXN, ...) are
+ * left alone.
+ *
+ * @returns {string[]} names of the removed files
+ */
+function pruneOldInputFiles(dir, keepFileName, prefix, testCase = 'OLSD141R') {
+  if (!fs.existsSync(dir)) return [];
+
+  const removed = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (name === keepFileName) continue;
+    if (!name.startsWith(prefix) || !name.endsWith('.dat')) continue;
+    try {
+      fs.removeSync(path.join(dir, name));
+      removed.push(name);
+    } catch (error) {
+      log(`[${testCase}] ⚠️ Cannot remove old file ${name}: ${maskSecret(error.message)}`);
+    }
+  }
+  if (removed.length) {
+    log(`[${testCase}] Kept ${keepFileName}, removed ${removed.length} older ${prefix}*.dat: ` +
+      `${removed.join(', ')}`);
+  }
+  return removed;
+}
+
 async function uploadFiles(fileNames, remotePath, testCase) {
   for (const name of fileNames) {
     const command = `"${CONFIG.winscp.path}" /command ` +
@@ -673,12 +703,18 @@ export async function prepareData(testCase = 'OLSD141R') {
   fs.ensureDirSync(CONFIG.winscp.localPath);
   fs.writeFileSync(path.join(CONFIG.seedCust.seedDir, custNameInfo.fileName), cust.content);
   fs.writeFileSync(stagingPath(custNameInfo.fileName), cust.content);
+  // Keep only the newest OLSCUST file (seed folder + local staging folder).
+  const prunedCust = [
+    ...pruneOldInputFiles(CONFIG.seedCust.seedDir, custNameInfo.fileName, CONFIG.seedCust.fileId),
+    ...pruneOldInputFiles(CONFIG.winscp.localPath, custNameInfo.fileName, CONFIG.seedCust.fileId),
+  ];
 
   add('1', `Generate ${CIF_COUNT} new CIF numbers (checked against ${SCHEMA}.client)`, true,
     `${cifs.join(', ')} (saved as cif1..cif${CIF_COUNT})`);
   add('2', `Build ${CONFIG.seedCust.fileId} input (recordAction='${CUST_ACTION}')`, true,
     `${custNameInfo.fileName}: ${cifs.length} detail record(s), ` +
-    `recordCount=${cust.recordCount}, createDate=${ctx.batchDateYmd}`);
+    `recordCount=${cust.recordCount}, createDate=${ctx.batchDateYmd}` +
+    ` | removed ${prunedCust.length} older ${CONFIG.seedCust.fileId}*.dat`);
 
   // ---- Step 2: run OLSDB012 ----
   await uploadFiles([custNameInfo.fileName], CONFIG.seedCust.remotePath, 'OLSDB012');
@@ -730,10 +766,16 @@ export async function prepareData(testCase = 'OLSD141R') {
   fs.ensureDirSync(CONFIG.seedMerge.seedDir);
   fs.writeFileSync(path.join(CONFIG.seedMerge.seedDir, mergeInfo.fileName), merge.content);
   fs.writeFileSync(stagingPath(mergeInfo.fileName), merge.content);
+  // Keep only the newest OLSMECIF file (seed folder + local staging folder).
+  const prunedMerge = [
+    ...pruneOldInputFiles(CONFIG.seedMerge.seedDir, mergeInfo.fileName, CONFIG.seedMerge.fileId),
+    ...pruneOldInputFiles(CONFIG.winscp.localPath, mergeInfo.fileName, CONFIG.seedMerge.fileId),
+  ];
 
   add('7', `Build ${CONFIG.seedMerge.fileId} input (${merges.length} merge records)`, true,
     `${mergeInfo.fileName} (Processing Date ${processingDate}): ` +
-    merges.map((m, i) => `cif${MERGE_PAIRS[i].source}->cif${MERGE_PAIRS[i].target}(${m.status})`).join(', '));
+    merges.map((m, i) => `cif${MERGE_PAIRS[i].source}->cif${MERGE_PAIRS[i].target}(${m.status})`).join(', ') +
+    ` | removed ${prunedMerge.length} older ${CONFIG.seedMerge.fileId}*.dat`);
 
   // ---- Step 4: run OLSDB057 ----
   await uploadFiles([mergeInfo.fileName], CONFIG.seedMerge.remotePath, 'OLSDB057');
