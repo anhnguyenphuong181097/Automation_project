@@ -39,6 +39,8 @@
     "test:olsdb028:tc01": "npx playwright test scripts/OLSDB028/test-runner.spec.js -g \"TC01\"",
     "test:olsdb028:tc03": "npx playwright test scripts/OLSDB028/test-runner.spec.js -g \"TC03\"",
     "generate:olsdb028": "node scripts/OLSDB028/file-generator.js",
+    "generate:olsdb037": "node scripts/OLSDB037/file-generator.js",
+    "test:olsdb037": "npx playwright test scripts/OLSDB037/test-runner.spec.js",
     "generate:dashboard": "node scripts/generate-dashboard.js",
     "generate:report": "node scripts/generate-batch-report.js",
     "report": "npx playwright show-report",

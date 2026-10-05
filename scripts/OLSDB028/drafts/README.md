@@ -129,3 +129,44 @@ npm run test:olsdb028
 `UG7814` là item EV duy nhất dùng được nhưng `qty_on_hand = 48` trong khi API chặn quantity < 100,
 và không có item EV nào có `qty_on_hand >= 100` + price còn hiệu lực. Muốn áp rule "EV phải ≤ tồn kho"
 thì cần: đổi sang item EV khác có tồn kho, hoặc hạ min-quantity trên dev, hoặc chấp nhận ngoại lệ.
+
+## 5. Field của dòng item trên OA — lấy từ form thật (02/10/2026)
+
+Không đoán nữa: trang Create (`moduleId=6412`) nạp bảng field qua
+`loadSubModuleSection?subModuleId=6413` → `loadSubModule`. HTML trả về có đủ nhãn + mã field, lưu tại
+`scripts/test-data/generated/OLSDB028/oa/submodule-fields-6413.html`. Các field liên quan:
+
+| Nhãn trên OA | Mã field |
+|---|---|
+| Catalogue / Item / Reward Currency | `R_641309` / `R_641308` / `R_641340` |
+| Redemption Quantity | `R_641310` |
+| Member Id / Member First Name / Member Last Name | `R_641312` / `R_641313` / `R_641314` |
+| **Email** | **`R_641321`** |
+| Mobile | `R_641320` |
+| Delivery Address 1 | `R_641317` |
+| City / Province / Country | `R_641334` / `R_641350` / `R_641351` |
+| Zip Code / Area | `R_641335` / `R_641336` |
+
+Bản nháp trước đây map sai nhóm "credit to account" (nhồi Member Id vào `R_641330` = *Pool Units
+Required*, `R_641351` = *Country*, `R_641334` = *City*, `R_641350` = *Province*) → đó là lý do TL
+Save được nhưng Approve trả `BLANK_REQUIRED_FIELD`. Đã bỏ nhánh sai này.
+
+### Traveloka (item `ITTL1`, type `TL`) — ĐÃ CHẠY ĐƯỢC 02/10
+
+Chỉ cần thêm **Email = `tvlk.coupon@gmail.com`**:
+
+```text
+quote ITTL1: pool=ENQ1 cur=0VN fullPrice=100 itemValue=100 listPrice=100 seq=77593 type=TL
+Save    -> "Record(s) created, pending for approval."
+Approve -> "Record(s) approved."
+IFS     -> ref 58278527, extracted 02-10-2026 10:58:03, last_update_by=olsadmin2
+```
+
+Kiểm tra đầu vào OLSDB028 cho row này: pool `ENQ1` có trong `statement_output_pool`
+(status `A`, hiệu lực 20-01-2024 → 21-01-2029, PAL list `[PARTNER, OCR, 802, 500, 501, CCC]`);
+row IFS có PAL `OCR` nằm trong list ✔. `trackStockQuantity = N`, `quantityOnHand = null` nên TL **không**
+vướng rule tồn kho.
+
+Script dùng để dò: `node scripts/OLSDB028/drafts/oa-field-probe.js --fields`
+(`--sub` để xem phần Item Listing, không tham số để xem trang Create); xem DB:
+`node scripts/OLSDB028/drafts/db-peek.js <reference_no>`.
